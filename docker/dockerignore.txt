@@ -1,3 +1,52 @@
-.git
-__pycache__
+# Build context shrinks + layer hygiene for Dockerfile.splitbuild.
+# Keep: pyproject.toml setup.py CMakeLists.txt MANIFEST.in build_rust.sh
+#       csrc/ rust/ vllm/ requirements/ benchmarks(optional) examples(optional)
+# Drop: VCS, CI, docs, caches, build artifacts, logs.
+.git/
+.gitignore
+.github/
+.buildkite/
+docs/
+tests/
+benchmarks/
+*.log
+*.pid
+*.digest
+Dockerfile*
+docker/
+launch/
+AGENTS.md
+CLAUDE.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+RELEASE.md
+SECURITY.md
+.claude/
+.gemini/
+.python-version
+CMakeUserPresets.json
+
+# python build artifacts
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+rust/target/
+
+# ccache / local caches
+.venv/
+__pycache__/
 *.pyc
+.build_cache/
