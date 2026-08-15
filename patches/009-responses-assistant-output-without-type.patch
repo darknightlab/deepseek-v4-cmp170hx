@@ -1,0 +1,76 @@
+diff --git a/tests/entrypoints/openai/responses/test_function_call_parsing.py b/tests/entrypoints/openai/responses/test_function_call_parsing.py
+index f90a641db..ba6d91411 100644
+--- a/tests/entrypoints/openai/responses/test_function_call_parsing.py
++++ b/tests/entrypoints/openai/responses/test_function_call_parsing.py
+@@ -377,3 +377,29 @@ def test_assistant_output_style_content_coerced():
+     assert item.content[0].annotations == []
+     assert item.status == "completed"
+     assert item.id.startswith("msg_")
++
++
++def test_assistant_output_style_content_without_type_coerced():
++    """Assistant output-message content without a top-level type is
++    normalized for clients that replay response output as conversation input."""
++    request_data = {
++        "model": "test-model",
++        "input": [
++            {
++                "role": "assistant",
++                "content": [{"type": "output_text", "text": "world"}],
++            },
++        ],
++    }
++
++    request = ResponsesRequest(**request_data)
++
++    item = request.input[0]
++    assert isinstance(item, ResponseOutputMessage), (
++        "Output-style assistant message without type should be coerced to "
++        f"ResponseOutputMessage, got {type(item)}"
++    )
++    assert item.content[0].text == "world"
++    assert item.content[0].annotations == []
++    assert item.status == "completed"
++    assert item.id.startswith("msg_")
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+index ad92766cb..67e26c64a 100644
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -523,6 +523,7 @@ class ResponsesRequest(OpenAIBaseModel):
+                 continue
+ 
+             item_type = item.get("type")
++            content = item.get("content")
+ 
+             if item_type == "function_call":
+                 try:
+@@ -546,8 +547,18 @@ class ResponsesRequest(OpenAIBaseModel):
+                     )
+                     processed_input.append(item)
+ 
+-            elif item_type == "message" and item.get("role") == "assistant":
+-                content = item.get("content")
++            elif item.get("role") == "assistant" and (
++                item_type == "message"
++                or (
++                    item_type is None
++                    and isinstance(content, list)
++                    and any(
++                        isinstance(part, dict)
++                        and part.get("type") in ("output_text", "refusal")
++                        for part in content
++                    )
++                )
++            ):
+                 if not isinstance(content, list):
+                     # String content is a valid EasyInputMessageParam,
+                     # do not coerce it to ResponseOutputMessage
+@@ -555,7 +566,7 @@ class ResponsesRequest(OpenAIBaseModel):
+                     continue
+ 
+                 original_item = item
+-                item = dict(item)
++                item = {**item, "type": "message"}
+                 if "id" not in item:
+                     item["id"] = f"msg_{random_uuid()}"
+                 if "status" not in item:
