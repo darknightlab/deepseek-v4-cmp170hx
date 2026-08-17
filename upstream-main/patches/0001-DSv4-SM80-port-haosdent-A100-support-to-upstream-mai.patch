@@ -1,4 +1,4 @@
-From 1bdf9eac99f112386e44fcd7adb4643b45e1172a Mon Sep 17 00:00:00 2001
+From 624e541f849390c1f1a8629bc9305d0b21bd650a Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:31:36 +0800
 Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
@@ -60,6 +60,7 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  vllm/v1/attention/backends/registry.py        |   6 +
  vllm/v1/attention/ops/fp8_sm80.py             | 173 ++++
  vllm/v1/attention/ops/mqa_logits_triton.py    | 653 ++++++++++++++
+ .../v1/attention/ops/rocm_aiter_mla_sparse.py |  39 +-
  .../attention/ops/triton_mla_sparse_kernel.py | 551 ++++++++++++
  vllm/v1/core/kv_cache_manager.py              |  31 +-
  vllm/v1/core/sched/output.py                  |   4 +-
@@ -73,7 +74,7 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  .../gpu/spec_decode/dspark/markov_argmax.py   | 451 ++++++++++
  vllm/v1/worker/gpu/spec_decode/speculator.py  |  16 +-
  vllm/v1/worker/gpu_model_runner.py            |   6 +-
- 69 files changed, 6418 insertions(+), 717 deletions(-)
+ 70 files changed, 6429 insertions(+), 745 deletions(-)
  create mode 100644 tests/kernels/attention/test_dsv4_fp8_sm80.py
  create mode 100644 tests/kernels/attention/test_mqa_logits_triton.py
  create mode 100644 tests/kernels/attention/test_triton_mla_sparse_kernel.py
@@ -7138,6 +7139,122 @@ index 0000000000..737870f7e2
 +    fp8_paged_mqa_logits_triton(
 +        q, kv_cache, weights, context_lens, block_tables, max_model_len=block_size
 +    )
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+index 5c9ab386d4..5785a50c06 100644
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -16,6 +16,7 @@ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import LayerNameType
+ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if current_platform.is_rocm():
+@@ -1335,10 +1336,7 @@ def _load_fp8_ds_mla_gfx950_nope_exact_chunk(
+     scales = _decode_e8m0_scales_triton(encoded_scales)
+     scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, CHUNK_SIZE // 64, 64))
+     scales = tl.reshape(scales, (BLOCK_K, CHUNK_SIZE))
+-    if IS_FNUZ:
+-        x_f32 = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.bfloat16).to(tl.float32)
+-    else:
+-        x_f32 = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ)
+     value = (x_f32 * scales).to(tl.bfloat16)
+     zero = tl.zeros((BLOCK_K, CHUNK_SIZE), dtype=tl.bfloat16)
+     return tl.where(valid[:, None], value, zero)
+@@ -1370,10 +1368,7 @@ def _load_fp8_ds_mla_gfx950_tail128(
+     scales = _decode_e8m0_scales_triton(encoded_scales)
+     scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, 2, 64))
+     scales = tl.reshape(scales, (BLOCK_K, 128))
+-    if IS_FNUZ:
+-        x_f32 = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.bfloat16).to(tl.float32)
+-    else:
+-        x_f32 = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ)
+     nope = (x_f32 * scales).to(tl.bfloat16)
+ 
+     rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+@@ -1475,17 +1470,14 @@ def _sparse_attn_decode_ragged_kernel(
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+-        if IS_FNUZ_MAIN:
+-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-        else:
+-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++        k_vals = _decode_fp8_f32(x_uint8, IS_FNUZ_MAIN)
+         encoded_scales = tl.load(
+             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+             mask=valid[:, None] & nope_mask[None, :],
+             other=127,
+         )
+         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -1543,17 +1535,14 @@ def _sparse_attn_decode_ragged_kernel(
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+-            if IS_FNUZ_EXTRA:
+-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-            else:
+-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++            k_vals = _decode_fp8_f32(x_uint8, IS_FNUZ_EXTRA)
+             encoded_scales = tl.load(
+                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=127,
+             )
+             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -1725,17 +1714,14 @@ def _sparse_attn_decode_partial_kernel(
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+-        if IS_FNUZ_MAIN:
+-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-        else:
+-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++        k_vals = _decode_fp8_f32(x_uint8, IS_FNUZ_MAIN)
+         encoded_scales = tl.load(
+             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+             mask=valid[:, None] & nope_mask[None, :],
+             other=127,
+         )
+         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -1796,17 +1782,14 @@ def _sparse_attn_decode_partial_kernel(
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+-            if IS_FNUZ_EXTRA:
+-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-            else:
+-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++            k_vals = _decode_fp8_f32(x_uint8, IS_FNUZ_EXTRA)
+             encoded_scales = tl.load(
+                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=127,
+             )
+             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
 diff --git a/vllm/v1/attention/ops/triton_mla_sparse_kernel.py b/vllm/v1/attention/ops/triton_mla_sparse_kernel.py
 new file mode 100644
 index 0000000000..bbcd5ca152

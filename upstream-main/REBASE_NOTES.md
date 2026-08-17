@@ -31,7 +31,9 @@ metadata. The first-layer MHC broadcast path likewise selects the existing
 TileLang prenorm GEMM when DeepGEMM is unavailable, matching the fallback
 already used by the other MHC pre paths. Its ragged SWA metadata builder also
 returns an empty FlashMLA scheduler plan, since the ROCm/Ampere Triton decode
-path never calls FlashMLA.
+path never calls FlashMLA. The shared ROCm/Ampere sparse decode kernels decode
+raw FP8 cache bytes through the SM80-aware helper, preserving native FNUZ/OCP
+casts where supported and using the software E4M3 path on pre-SM89 CUDA.
 
 The full build also exposed two native compile errors. The fork's persistent
 top-k rewrite indexed two histogram buffers with an out-of-scope `iter`
