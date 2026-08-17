@@ -1,4 +1,4 @@
-From 642120aaa3ee7444f9a724d5a613bc0c88dba31b Mon Sep 17 00:00:00 2001
+From 049a5b786ccd40b6b7060eab83bfba39e81e9b6c Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:31:36 +0800
 Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
@@ -62,19 +62,14 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  vllm/v1/attention/ops/mqa_logits_triton.py    | 653 ++++++++++++++
  .../v1/attention/ops/rocm_aiter_mla_sparse.py |  39 +-
  .../attention/ops/triton_mla_sparse_kernel.py | 551 ++++++++++++
- vllm/v1/core/kv_cache_manager.py              |  31 +-
- vllm/v1/core/sched/output.py                  |   4 +-
- vllm/v1/core/sched/scheduler.py               |  30 +-
  vllm/v1/executor/multiproc_executor.py        |   4 +-
  vllm/v1/structured_output/__init__.py         | 158 +++-
  vllm/v1/structured_output/backend_xgrammar.py |  11 +-
- vllm/v1/worker/cpu_model_runner.py            |  13 +-
  vllm/v1/worker/gpu/buffer_utils.py            |  72 ++
  vllm/v1/worker/gpu/cudagraph_utils.py         |  41 +
  .../gpu/spec_decode/dspark/markov_argmax.py   | 451 ++++++++++
  vllm/v1/worker/gpu/spec_decode/speculator.py  |  16 +-
- vllm/v1/worker/gpu_model_runner.py            |   6 +-
- 70 files changed, 6455 insertions(+), 747 deletions(-)
+ 65 files changed, 6398 insertions(+), 720 deletions(-)
  create mode 100644 tests/kernels/attention/test_dsv4_fp8_sm80.py
  create mode 100644 tests/kernels/attention/test_mqa_logits_triton.py
  create mode 100644 tests/kernels/attention/test_triton_mla_sparse_kernel.py
@@ -7883,136 +7878,6 @@ index 0000000000..bbcd5ca152
 +        num_warps=2,
 +    )
 +    return out
-diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index d1af91b659..ccbc7aaefd 100644
---- a/vllm/v1/core/kv_cache_manager.py
-+++ b/vllm/v1/core/kv_cache_manager.py
-@@ -802,25 +802,34 @@ class KVCacheManager:
-             truncated.append(list(group_blocks[:num_blocks]))
-         return self.create_kv_cache_blocks(tuple(truncated))
- 
--    def take_new_block_ids(self) -> list[int]:
--        """Drain and return new attention block IDs for zeroing."""
--        ids: list[int] = []
--        for mgr in self.coordinator.single_type_managers:
--            ids.extend(mgr.take_new_block_ids())
--        return ids
-+    def take_new_block_ids(self) -> list[list[int]]:
-+        """Drain and return new attention block IDs for zeroing, per
-+        kv-cache group.
-+
-+        Block ids are only meaningful within their own group: with virtual
-+        block splitting, the same id maps to different physical pages in
-+        groups with different block geometries, so a flat cross-group list
-+        would wipe live blocks of other groups (#50576).
-+        """
-+        return [
-+            mgr.take_new_block_ids() for mgr in self.coordinator.single_type_managers
-+        ]
- 
-     def get_zeroing_block_ids_in_range(
-         self, request_id: str, start_token: int, end_token: int
--    ) -> list[int]:
--        """The request's block ids covering [start_token, end_token), from
--        the groups whose new blocks are zeroed by the worker."""
--        ids: list[int] = []
-+    ) -> list[list[int]]:
-+        """The request's block ids covering [start_token, end_token), per
-+        kv-cache group; empty for groups whose new blocks the worker does
-+        not zero."""
-+        ids: list[list[int]] = []
-         for mgr in self.coordinator.single_type_managers:
-             if mgr.records_new_block_ids:
-                 start_idx = start_token // mgr.block_size
-                 end_idx = cdiv(end_token, mgr.block_size)
-                 blocks = mgr.req_to_blocks[request_id]
--                ids.extend(blk.block_id for blk in blocks[start_idx:end_idx])
-+                ids.append([blk.block_id for blk in blocks[start_idx:end_idx]])
-+            else:
-+                ids.append([])
-         return ids
- 
-     def record_blocks_for_zeroing(self, request_id: str, start_token: int) -> None:
-diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
-index 8782061356..de7ab86f5e 100644
---- a/vllm/v1/core/sched/output.py
-+++ b/vllm/v1/core/sched/output.py
-@@ -253,7 +253,9 @@ class SchedulerOutput:
-     # Block IDs freshly allocated from the pool during this scheduling step.
-     # The worker zeros the corresponding GPU memory before the blocks are used,
-     # preventing stale NaN/data from corrupting attention or SSM computation.
--    new_block_ids_to_zero: list[int] | None = None
-+    # Per kv-cache group: ids are group-scoped (virtual block splitting maps
-+    # the same id to different pages in different groups).
-+    new_block_ids_to_zero: list[list[int]] | None = None
- 
-     # CoW copies to apply after zeroing new blocks and before forward.
-     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
-diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index e4a2132866..4fd6103af6 100644
---- a/vllm/v1/core/sched/scheduler.py
-+++ b/vllm/v1/core/sched/scheduler.py
-@@ -312,7 +312,8 @@ class Scheduler(SchedulerInterface):
-         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
-         # Blocks that async KV loads will overwrite this step, skipped from
-         # zeroing since the zeroing could race the out-of-band write.
--        self._skip_zero_block_ids: set[int] = set()
-+        # Keyed by kv-cache group id: block ids are group-scoped.
-+        self._skip_zero_block_ids: dict[int, set[int]] = {}
-         self.need_mamba_block_aligned_split = (
-             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
-         )
-@@ -1103,13 +1104,17 @@ class Scheduler(SchedulerInterface):
-                     if self.needs_kv_cache_zeroing:
-                         # Skip zeroing of the blocks the async load will
-                         # overwrite; the zeroing could race the write.
--                        self._skip_zero_block_ids.update(
--                            self.kv_cache_manager.get_zeroing_block_ids_in_range(
--                                request.request_id,
--                                num_new_local_computed_tokens,
--                                num_computed_tokens,
--                            )
-+                        mgr = self.kv_cache_manager
-+                        per_group = mgr.get_zeroing_block_ids_in_range(
-+                            request.request_id,
-+                            num_new_local_computed_tokens,
-+                            num_computed_tokens,
-                         )
-+                        for group_id, ids in enumerate(per_group):
-+                            if ids:
-+                                self._skip_zero_block_ids.setdefault(
-+                                    group_id, set()
-+                                ).update(ids)
-                     continue
- 
-                 self.running.append(request)
-@@ -1319,7 +1324,7 @@ class Scheduler(SchedulerInterface):
-     ) -> KVConnectorMetadata:
-         return connector.build_connector_meta(scheduler_output)
- 
--    def _get_new_block_ids_to_zero(self) -> list[int] | None:
-+    def _get_new_block_ids_to_zero(self) -> list[list[int]] | None:
-         # Drain new attention block ids every step so the manager-side list
-         # does not grow unbounded; only kv-cache zeroing consumes them.
-         new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
-@@ -1328,10 +1333,15 @@ class Scheduler(SchedulerInterface):
- 
-         if self._skip_zero_block_ids:
-             skip = self._skip_zero_block_ids
--            new_block_ids_to_zero = [b for b in new_block_ids_to_zero if b not in skip]
-+            new_block_ids_to_zero = [
-+                [b for b in ids if b not in skip.get(group_id, ())]
-+                for group_id, ids in enumerate(new_block_ids_to_zero)
-+            ]
-             skip.clear()
- 
--        return new_block_ids_to_zero or None
-+        if not any(new_block_ids_to_zero):
-+            return None
-+        return new_block_ids_to_zero
- 
-     def _preempt_request(
-         self, request: Request, timestamp: float, drop_stale_output: bool = False
 diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
 index df20a90d51..aea78e62ab 100644
 --- a/vllm/v1/executor/multiproc_executor.py
@@ -8257,36 +8122,6 @@ index 258b1dff32..a8c654ae68 100644
                      request_id,
                      token,
                  )
-diff --git a/vllm/v1/worker/cpu_model_runner.py b/vllm/v1/worker/cpu_model_runner.py
-index 3e7f0d4c1e..37dcf742b3 100644
---- a/vllm/v1/worker/cpu_model_runner.py
-+++ b/vllm/v1/worker/cpu_model_runner.py
-@@ -172,14 +172,23 @@ class CPUModelRunner(GPUModelRunner):
-     def _sync_device(self) -> None:
-         pass
- 
--    def _zero_block_ids(self, block_ids: list[int]) -> None:
-+    def _zero_block_ids(self, block_ids_per_group: list[list[int]]) -> None:
-         # Zero full-attention blocks to prevent stale data corruption on partial writes.
-         # Encoder-only (runner-only) layers are not FullAttentionSpec, so the
-         # spec filter below already excludes them; no runner-only skip needed.
-+        # Block ids are group-scoped: zeroing another group's id would wipe a
-+        # live block there (#50576).
-         seen_ptrs: set[int] = set()
--        for group in self.kv_cache_config.kv_cache_groups:
-+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
-             if not isinstance(group.kv_cache_spec, FullAttentionSpec):
-                 continue
-+            block_ids = (
-+                block_ids_per_group[group_id]
-+                if group_id < len(block_ids_per_group)
-+                else []
-+            )
-+            if not block_ids:
-+                continue
-             for layer_name in group.layer_names:
-                 ctx = self.compilation_config.static_forward_context.get(layer_name)
-                 if ctx is None:
 diff --git a/vllm/v1/worker/gpu/buffer_utils.py b/vllm/v1/worker/gpu/buffer_utils.py
 index f8336fa074..eb2fb1295c 100644
 --- a/vllm/v1/worker/gpu/buffer_utils.py
@@ -8923,21 +8758,3 @@ index 69e0cc1091..d4ed5bb74d 100644
              )
          logger.info(
              "Using local argmax reduction for draft token generation "
-diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index a8d08a7bf2..b8aa555aa9 100644
---- a/vllm/v1/worker/gpu_model_runner.py
-+++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -1205,10 +1205,10 @@ class GPUModelRunner(
-             static_forward_context=self.compilation_config.static_forward_context,
-         )
- 
--    def _zero_block_ids(self, block_ids: list[int]) -> None:
--        """Zero the KV cache memory for the given block IDs."""
-+    def _zero_block_ids(self, block_ids_per_group: list[list[int]]) -> None:
-+        """Zero the KV cache memory for the given per-group block IDs."""
-         if hasattr(self, "_kv_block_zeroer"):
--            self._kv_block_zeroer.zero_block_ids(block_ids)
-+            self._kv_block_zeroer.zero_block_ids(block_ids_per_group)
- 
-     # Note: used for model runner override.
-     def _init_device_properties(self) -> None:

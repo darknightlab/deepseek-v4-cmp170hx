@@ -78,7 +78,10 @@ vllm/v1/worker/utils.py
 Relevant later upstream work includes KV block-zeroing fixes (#50276, #51749,
 #52058), DSpark scheduling (#47808), DSV4 plain/MTP/DSpark correctness (#51538),
 KV layout changes (#51704), and structured-output fixes (#52436). Choosing the
-old fork side wholesale for these conflicts would discard those changes.
+old fork side wholesale for these conflicts would discard those changes. The
+fork's paired per-group block-zeroing scheduler protocol is also omitted, so
+`KVCacheManager`, scheduler output, and the newer official `KVBlockZeroer`
+retain one internally consistent upstream contract.
 
 Fork-only conflict hunks not ported are optional or superseded paths, including
 adaptive Marlin workspace/block sizing, MHC fused-sqrsum and int8 all-reduce
