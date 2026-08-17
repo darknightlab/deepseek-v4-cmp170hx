@@ -1,4 +1,4 @@
-From c0589b0e55e0e011a815f17906b7708f87e03861 Mon Sep 17 00:00:00 2001
+From 08557e7c8f493d5f618a956c0174be883a79460f Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:31:36 +0800
 Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
@@ -6,7 +6,7 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
 ---
  csrc/custom_all_reduce.cuh                    | 301 ++++++-
  csrc/libtorch_stable/custom_all_reduce.cu     |  59 ++
- csrc/libtorch_stable/ops.h                    |   3 +
+ csrc/libtorch_stable/ops.h                    |   6 +
  csrc/libtorch_stable/persistent_topk.cuh      | 836 ++++++++++--------
  .../quantization/marlin/marlin.cu             | 137 ++-
  csrc/libtorch_stable/sampler.cu               | 164 ++--
@@ -69,7 +69,7 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  .../gpu/spec_decode/dspark/markov_argmax.py   | 451 ++++++++++
  vllm/v1/worker/gpu/spec_decode/speculator.py  |  16 +-
  vllm/v1/worker/gpu_model_runner.py            |   6 +-
- 65 files changed, 6358 insertions(+), 704 deletions(-)
+ 65 files changed, 6361 insertions(+), 704 deletions(-)
  create mode 100644 tests/kernels/attention/test_dsv4_fp8_sm80.py
  create mode 100644 tests/kernels/attention/test_mqa_logits_triton.py
  create mode 100644 tests/kernels/attention/test_triton_mla_sparse_kernel.py
@@ -481,10 +481,20 @@ index 07fca99ddd..872529dd36 100644
    delete reinterpret_cast<vllm::CustomAllreduce*>(_fa);
  }
 diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
-index 5c595bfaf4..a5efe75941 100644
+index 5c595bfaf4..7f545c1484 100644
 --- a/csrc/libtorch_stable/ops.h
 +++ b/csrc/libtorch_stable/ops.h
-@@ -482,6 +482,9 @@ fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
+@@ -401,6 +401,9 @@ void fused_kda_decode(
+     std::optional<torch::stable::Tensor> output_gate,
+     std::optional<torch::stable::Tensor> norm_weight, double norm_eps);
+ 
++#endif
++
++#ifdef VLLM_ENABLE_FUSED_GDN_DECODE
+ void fused_gdn_decode_post_conv_mtp(
+     torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,
+     torch::stable::Tensor const& b, torch::stable::Tensor const& a_log,
+@@ -482,6 +485,9 @@ fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
  void all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
                  torch::stable::Tensor& out, fptr_t reg_buffer,
                  int64_t reg_buffer_sz_bytes);
