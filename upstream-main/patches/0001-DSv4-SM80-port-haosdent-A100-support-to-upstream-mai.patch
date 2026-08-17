@@ -1,4 +1,4 @@
-From a28999f9eeffb2a4108021e6c6fddd3975334f82 Mon Sep 17 00:00:00 2001
+From 1bdf9eac99f112386e44fcd7adb4643b45e1172a Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:31:36 +0800
 Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
@@ -37,6 +37,7 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  .../warmup/sparse_mla_triton_warmup.py        |   1 +
  vllm/models/deepseek_v32/amd/rocm.py          |   1 +
  vllm/models/deepseek_v32/attention.py         |   1 +
+ vllm/models/deepseek_v4/amd/rocm.py           |   6 +
  vllm/models/deepseek_v4/ampere/__init__.py    |   2 +
  .../deepseek_v4/ampere/ampere_sparse.py       |  32 +
  vllm/models/deepseek_v4/attention.py          |   1 +
@@ -72,7 +73,7 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  .../gpu/spec_decode/dspark/markov_argmax.py   | 451 ++++++++++
  vllm/v1/worker/gpu/spec_decode/speculator.py  |  16 +-
  vllm/v1/worker/gpu_model_runner.py            |   6 +-
- 68 files changed, 6412 insertions(+), 717 deletions(-)
+ 69 files changed, 6418 insertions(+), 717 deletions(-)
  create mode 100644 tests/kernels/attention/test_dsv4_fp8_sm80.py
  create mode 100644 tests/kernels/attention/test_mqa_logits_triton.py
  create mode 100644 tests/kernels/attention/test_triton_mla_sparse_kernel.py
@@ -5285,6 +5286,23 @@ index 87458316c0..d7df7e893b 100644
          )
  
      def forward(
+diff --git a/vllm/models/deepseek_v4/amd/rocm.py b/vllm/models/deepseek_v4/amd/rocm.py
+index 5e7609bd11..7e651b5cc0 100644
+--- a/vllm/models/deepseek_v4/amd/rocm.py
++++ b/vllm/models/deepseek_v4/amd/rocm.py
+@@ -405,6 +405,12 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
+     # also refreshes the ROCm-specific ragged SWA indices and indptrs.
+     supports_draft_decode_metadata_update = False
+ 
++    def build_tile_scheduler(self, num_decode_tokens: int):
++        # Ragged Triton decode never calls FlashMLA. Reuse the base builder's
++        # no-decode result to preserve its complete layer-type key set while
++        # skipping FlashMLA scheduler planning on ROCm and CUDA SM8x.
++        return super().build_tile_scheduler(0)
++
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
 diff --git a/vllm/models/deepseek_v4/ampere/__init__.py b/vllm/models/deepseek_v4/ampere/__init__.py
 new file mode 100644
 index 0000000000..208f01a7cb

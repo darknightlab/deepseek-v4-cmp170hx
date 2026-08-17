@@ -29,7 +29,9 @@ indexer fallback is retained separately: CUDA devices without DeepGEMM now
 pre-warm and use the Triton MQA kernels, without importing any query-sharding
 metadata. The first-layer MHC broadcast path likewise selects the existing
 TileLang prenorm GEMM when DeepGEMM is unavailable, matching the fallback
-already used by the other MHC pre paths.
+already used by the other MHC pre paths. Its ragged SWA metadata builder also
+returns an empty FlashMLA scheduler plan, since the ROCm/Ampere Triton decode
+path never calls FlashMLA.
 
 The full build also exposed two native compile errors. The fork's persistent
 top-k rewrite indexed two histogram buffers with an out-of-scope `iter`
