@@ -24,7 +24,10 @@ files:
 Those two experimental feature groups were restored to the official-main
 implementation as a unit. Their conflict-coupled tests and the fork's benchmark
 artifacts are not carried in this production candidate. Three focused SM80
-kernel tests remain in the patch.
+kernel tests remain in the patch. The required constructor half of the SM80
+indexer fallback is retained separately: CUDA devices without DeepGEMM now
+pre-warm and use the Triton MQA kernels, without importing any query-sharding
+metadata.
 
 The full build also exposed two native compile errors. The fork's persistent
 top-k rewrite indexed two histogram buffers with an out-of-scope `iter`

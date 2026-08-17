@@ -1,4 +1,4 @@
-From 11b9be2b028d24b2394c558f116c60c5a7487bed Mon Sep 17 00:00:00 2001
+From a256b085236360b34a693012e88e248266faddea Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:10:58 +0800
 Subject: [PATCH 2/2] Apply deepseek-v4-cmp170hx downstream patches on upstream
@@ -107,7 +107,7 @@ index ff3331612f..378f94080a 100644
                      item["id"] = f"msg_{random_uuid()}"
                  if "status" not in item:
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index d94b377dbe..4d1e412fb6 100644
+index e147edaf37..0ea500ab5b 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -2,6 +2,8 @@
@@ -119,7 +119,7 @@ index d94b377dbe..4d1e412fb6 100644
  import torch
  
  import vllm.envs as envs
-@@ -43,6 +45,7 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+@@ -44,6 +46,7 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
  
  # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
  MXFP4_BLOCK_SIZE = 32
@@ -127,7 +127,7 @@ index d94b377dbe..4d1e412fb6 100644
  
  
  def _assert_cutedsl_dcp_merge_supported(
-@@ -124,6 +127,78 @@ def _merge_dcp_topk_global(
+@@ -125,6 +128,78 @@ def _merge_dcp_topk_global(
      )
  
  
@@ -206,7 +206,7 @@ index d94b377dbe..4d1e412fb6 100644
  @triton.jit
  def _fused_indexer_q_rope_quant_kernel(
      positions,
-@@ -496,6 +571,50 @@ def sparse_attn_indexer(
+@@ -497,6 +572,50 @@ def sparse_attn_indexer(
                          cu_seqlen_ks,
                          cu_seqlen_ke,
                      )
@@ -257,7 +257,7 @@ index d94b377dbe..4d1e412fb6 100644
                  else:
                      logits = fp8_fp4_mqa_logits(
                          (q_slice_cast, q_scale_slice),
-@@ -505,17 +624,26 @@ def sparse_attn_indexer(
+@@ -506,17 +625,26 @@ def sparse_attn_indexer(
                          cu_seqlen_ke,
                          clean_logits=False,
                      )
