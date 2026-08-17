@@ -1,4 +1,4 @@
-From 0272581fb5a09b282471d66c7ac1f2a732ca2aa7 Mon Sep 17 00:00:00 2001
+From c0589b0e55e0e011a815f17906b7708f87e03861 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:31:36 +0800
 Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
@@ -495,7 +495,7 @@ index 5c595bfaf4..a5efe75941 100644
                         torch::stable::Tensor& out, fptr_t reg_buffer,
                         int64_t reg_buffer_sz_bytes);
 diff --git a/csrc/libtorch_stable/persistent_topk.cuh b/csrc/libtorch_stable/persistent_topk.cuh
-index 9ae0fd4bcb..efe443eb29 100644
+index 9ae0fd4bcb..8b21165dca 100644
 --- a/csrc/libtorch_stable/persistent_topk.cuh
 +++ b/csrc/libtorch_stable/persistent_topk.cuh
 @@ -245,169 +245,211 @@ __device__ __noinline__ void histogram_2048_topk(
@@ -1056,7 +1056,7 @@ index 9ae0fd4bcb..efe443eb29 100644
 +  // with it the pivot, the selected set, and the output bounds). Zero it
 +  // explicitly behind the initial barrier — no extra synchronization needed.
 +  if (cta_in_group == 0) {
-+    uint32_t* round0_hist = state->histogram[(iter * 4) % 3];
++    uint32_t* round0_hist = state->histogram[(radix_iter * 4) % 3];
 +    for (uint32_t i = tx; i < RADIX; i += kThreadsPerBlock) {
 +      round0_hist[i] = 0;
 +    }
@@ -1126,7 +1126,7 @@ index 9ae0fd4bcb..efe443eb29 100644
 +  // (< 64K elements), so 16 bits per component suffice. The counts buffer
 +  // reuses the histogram slot that is not referenced again until it is
 +  // zeroed (behind a barrier) in the next iteration's round 0/1.
-+  uint32_t* counts_buf = state->histogram[(iter * 4 + 5) % 3];
++  uint32_t* counts_buf = state->histogram[(radix_iter * 4 + 5) % 3];
    if (tx == 0) {
 -    local_histogram[0] = 0;
 -    if (local_gt_count > 0) {

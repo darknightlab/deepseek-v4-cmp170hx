@@ -26,6 +26,11 @@ implementation as a unit. Their conflict-coupled tests and the fork's benchmark
 artifacts are not carried in this production candidate. Three focused SM80
 kernel tests remain in the patch.
 
+The first full sm_80 build also exposed a compile error inherited from the fork's
+persistent top-k rewrite: `radix_topk()` indexed two histogram buffers with an
+out-of-scope `iter` identifier. Both sites now use the function's `radix_iter`
+parameter, matching its existing global-round calculation.
+
 The semantic review retained official main for 16 conflict files and ported the
 required fork behavior into two conflict files:
 
