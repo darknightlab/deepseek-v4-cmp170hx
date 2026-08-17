@@ -1,4 +1,4 @@
-From 5e802e3add8756dba45c4671d13ab7a1638a0ae4 Mon Sep 17 00:00:00 2001
+From 8ebe748d8e262660be00530f1fb1665a053ce7e2 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:10:58 +0800
 Subject: [PATCH 2/2] Apply deepseek-v4-cmp170hx downstream patches on upstream
@@ -163,7 +163,7 @@ index ff3331612f..378f94080a 100644
                      item["id"] = f"msg_{random_uuid()}"
                  if "status" not in item:
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index e92d051eb4..16718f264d 100644
+index d556480634..bd9d409a53 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -2,6 +2,8 @@
