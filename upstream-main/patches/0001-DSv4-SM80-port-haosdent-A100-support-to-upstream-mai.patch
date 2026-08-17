@@ -1,4 +1,4 @@
-From 624e541f849390c1f1a8629bc9305d0b21bd650a Mon Sep 17 00:00:00 2001
+From 986b42bb78b75731763a3b13b2da224b333a1fe9 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:31:36 +0800
 Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
@@ -31,7 +31,7 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  .../layers/fused_moe/moe_align_block_size.py  | 120 ++-
  .../layers/fused_moe/router/gate_linear.py    |  18 +
  .../model_executor/layers/logits_processor.py | 131 ++-
- .../layers/sparse_attn_indexer.py             |  29 +-
+ .../layers/sparse_attn_indexer.py             |  57 +-
  vllm/model_executor/models/deepseek_v2.py     |   5 +
  vllm/model_executor/warmup/cutedsl_warmup.py  |   3 +
  .../warmup/sparse_mla_triton_warmup.py        |   1 +
@@ -74,7 +74,7 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  .../gpu/spec_decode/dspark/markov_argmax.py   | 451 ++++++++++
  vllm/v1/worker/gpu/spec_decode/speculator.py  |  16 +-
  vllm/v1/worker/gpu_model_runner.py            |   6 +-
- 70 files changed, 6429 insertions(+), 745 deletions(-)
+ 70 files changed, 6455 insertions(+), 747 deletions(-)
  create mode 100644 tests/kernels/attention/test_dsv4_fp8_sm80.py
  create mode 100644 tests/kernels/attention/test_mqa_logits_triton.py
  create mode 100644 tests/kernels/attention/test_triton_mla_sparse_kernel.py
@@ -5161,7 +5161,7 @@ index 31298a66be..87b67d08a7 100644
      def extra_repr(self) -> str:
          s = f"vocab_size={self.vocab_size}"
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index d94b377dbe..e147edaf37 100644
+index d94b377dbe..e92d051eb4 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -23,6 +23,7 @@ from vllm.utils.deep_gemm import (
@@ -5172,7 +5172,77 @@ index d94b377dbe..e147edaf37 100644
  )
  from vllm.utils.import_utils import has_cutedsl
  from vllm.utils.torch_utils import (
-@@ -748,6 +749,7 @@ class SparseAttnIndexer(CustomOp):
+@@ -35,6 +36,10 @@ from vllm.v1.attention.backends.mla.indexer import (
+     DeepseekV32IndexerMetadata,
+ )
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops.mqa_logits_triton import (
++    fp8_mqa_logits_triton,
++    fp8_paged_mqa_logits_triton,
++)
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ logger = init_logger(__name__)
+@@ -375,6 +380,7 @@ def sparse_attn_indexer(
+         assert q_scale is not None, "use_fp4_cache=True requires q_scale"
+     else:
+         assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
++    use_deep_gemm = is_deep_gemm_supported()
+ 
+     # During speculative decoding, k may be padded to the CUDA graph batch
+     # size while slot_mapping only covers actual tokens. Truncate k to avoid
+@@ -496,7 +502,7 @@ def sparse_attn_indexer(
+                         cu_seqlen_ks,
+                         cu_seqlen_ke,
+                     )
+-                else:
++                elif use_deep_gemm:
+                     logits = fp8_fp4_mqa_logits(
+                         (q_slice_cast, q_scale_slice),
+                         (k_quant_cast, k_scale_cast),
+@@ -505,6 +511,15 @@ def sparse_attn_indexer(
+                         cu_seqlen_ke,
+                         clean_logits=False,
+                     )
++                else:
++                    logits = fp8_mqa_logits_triton(
++                        q_slice_cast,
++                        (k_quant_cast, k_scale_cast),
++                        weights[chunk.token_start : chunk.token_end],
++                        cu_seqlen_ks,
++                        cu_seqlen_ke,
++                        clean_logits=False,
++                    )
+                 num_rows = logits.shape[0]
+                 ops.top_k_per_row_prefill(
+                     logits,
+@@ -599,7 +614,7 @@ def sparse_attn_indexer(
+                 decode_metadata.schedule_metadata,
+                 max_model_len,
+             )
+-        else:
++        elif use_deep_gemm:
+             logits = fp8_fp4_paged_mqa_logits(
+                 (padded_q_quant_cast, padded_q_scale),
+                 kv_cache,
+@@ -611,6 +626,16 @@ def sparse_attn_indexer(
+                 clean_logits=False,
+                 indices=decode_metadata.indices,
+             )
++        else:
++            logits = fp8_paged_mqa_logits_triton(
++                padded_q_quant_cast,
++                kv_cache,
++                weights[:num_padded_tokens],
++                seq_lens,
++                decode_metadata.block_table,
++                max_model_len=decode_metadata.max_seq_len,
++                clean_logits=False,
++            )
+         num_rows = logits.shape[0]
+         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+ 
+@@ -748,6 +773,7 @@ class SparseAttnIndexer(CustomOp):
          max_model_len: int,
          max_total_seq_len: int,
          topk_indices_buffer: torch.Tensor,
@@ -5180,7 +5250,7 @@ index d94b377dbe..e147edaf37 100644
          skip_k_cache_insert: bool = False,
          use_fp4_cache: bool = False,
      ):
-@@ -771,11 +773,30 @@ class SparseAttnIndexer(CustomOp):
+@@ -771,12 +797,31 @@ class SparseAttnIndexer(CustomOp):
          self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
          self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
          self.use_pcp = parallel_config.prefill_context_parallel_size > 1
@@ -5192,14 +5262,14 @@ index d94b377dbe..e147edaf37 100644
 +            logger.warning_once(
 +                "DeepGEMM not supported on this platform; using Triton "
 +                "fallback for sparse attention indexer."
-             )
++            )
 +            # Autotuning synchronizes, so prime both fallback kernels before
 +            # memory profiling starts cudagraph capture.
 +            from vllm.v1.attention.ops.mqa_logits_triton import (
 +                warmup_fp8_mqa_logits_triton,
 +                warmup_fp8_paged_mqa_logits_triton,
-+            )
-+
+             )
+ 
 +            if not use_fp4_cache:
 +                device = topk_indices_buffer.device
 +                warmup_fp8_mqa_logits_triton(num_heads, head_dim, device)
@@ -5212,9 +5282,10 @@ index d94b377dbe..e147edaf37 100644
 +                    warmup_fp8_paged_mqa_logits_triton(
 +                        num_heads, head_dim, kernel_block_size, device
 +                    )
- 
++
      def forward_native(
          self,
+         hidden_states: torch.Tensor,
 diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
 index 81e941d284..e97379474c 100644
 --- a/vllm/model_executor/models/deepseek_v2.py

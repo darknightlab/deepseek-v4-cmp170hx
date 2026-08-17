@@ -1,24 +1,24 @@
-From 4577b82d0b746e452186fd0e9175542674899732 Mon Sep 17 00:00:00 2001
+From 5e802e3add8756dba45c4671d13ab7a1638a0ae4 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:10:58 +0800
 Subject: [PATCH 2/2] Apply deepseek-v4-cmp170hx downstream patches on upstream
  main
 
 ---
- .../responses/test_function_call_parsing.py   |  26 +++
+ .../responses/test_function_call_parsing.py   |  26 ++++
  .../v1/simple_kv_offload/test_disk_backend.py |  45 ++++++
  vllm/config/speculative.py                    |   3 +
  vllm/entrypoints/openai/responses/protocol.py |  17 +-
- .../layers/sparse_attn_indexer.py             | 150 ++++++++++++++++--
+ .../layers/sparse_attn_indexer.py             | 145 ++++++++++++++++--
  vllm/v1/simple_kv_offload/cuda_mem_ops.py     |  28 ++--
- vllm/v1/simple_kv_offload/disk_backend.py     |  77 +++++----
+ vllm/v1/simple_kv_offload/disk_backend.py     |  77 ++++++----
  vllm/v1/simple_kv_offload/worker.py           |  10 +-
  vllm/v1/structured_output/__init__.py         |  21 ++-
  vllm/v1/structured_output/backend_xgrammar.py |  21 ++-
  vllm/v1/worker/gpu/model_runner.py            |  14 +-
  vllm/v1/worker/gpu/pp_utils.py                |  63 ++++++++
  .../v1/worker/gpu/spec_decode/dspark/utils.py |  90 ++++++++++-
- 13 files changed, 493 insertions(+), 72 deletions(-)
+ 13 files changed, 488 insertions(+), 72 deletions(-)
  create mode 100644 tests/v1/simple_kv_offload/test_disk_backend.py
 
 diff --git a/tests/entrypoints/openai/responses/test_function_call_parsing.py b/tests/entrypoints/openai/responses/test_function_call_parsing.py
@@ -163,7 +163,7 @@ index ff3331612f..378f94080a 100644
                      item["id"] = f"msg_{random_uuid()}"
                  if "status" not in item:
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index e147edaf37..0ea500ab5b 100644
+index e92d051eb4..16718f264d 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -2,6 +2,8 @@
@@ -175,7 +175,7 @@ index e147edaf37..0ea500ab5b 100644
  import torch
  
  import vllm.envs as envs
-@@ -44,6 +46,7 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+@@ -48,6 +50,7 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
  
  # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
  MXFP4_BLOCK_SIZE = 32
@@ -183,7 +183,7 @@ index e147edaf37..0ea500ab5b 100644
  
  
  def _assert_cutedsl_dcp_merge_supported(
-@@ -125,6 +128,78 @@ def _merge_dcp_topk_global(
+@@ -129,6 +132,78 @@ def _merge_dcp_topk_global(
      )
  
  
@@ -262,9 +262,9 @@ index e147edaf37..0ea500ab5b 100644
  @triton.jit
  def _fused_indexer_q_rope_quant_kernel(
      positions,
-@@ -497,6 +572,50 @@ def sparse_attn_indexer(
-                         cu_seqlen_ks,
+@@ -511,6 +586,45 @@ def sparse_attn_indexer(
                          cu_seqlen_ke,
+                         clean_logits=False,
                      )
 +                elif _DSV4_LOGITS_ROW_CHUNK > 0 and dcp_world_size <= 1:
 +                    # Cap the SM80 prefill logits transient at rows x context.
@@ -273,13 +273,8 @@ index e147edaf37..0ea500ab5b 100644
 +                    use_torch_topk = _prefill_topk_needs_torch_fallback()
 +                    for row_start in range(0, total_rows, step):
 +                        row_end = min(row_start + step, total_rows)
-+                        q_scale_chunk = (
-+                            q_scale_slice[row_start:row_end]
-+                            if q_scale_slice is not None
-+                            else None
-+                        )
-+                        chunk_logits = fp8_fp4_mqa_logits(
-+                            (q_slice_cast[row_start:row_end], q_scale_chunk),
++                        chunk_logits = fp8_mqa_logits_triton(
++                            q_slice_cast[row_start:row_end],
 +                            (k_quant_cast, k_scale_cast),
 +                            weights[
 +                                chunk.token_start + row_start : chunk.token_start
@@ -311,9 +306,9 @@ index e147edaf37..0ea500ab5b 100644
 +                        del chunk_logits
 +                    logits = q_slice_cast.new_empty((0, 0), dtype=torch.float32)
                  else:
-                     logits = fp8_fp4_mqa_logits(
-                         (q_slice_cast, q_scale_slice),
-@@ -506,17 +625,26 @@ def sparse_attn_indexer(
+                     logits = fp8_mqa_logits_triton(
+                         q_slice_cast,
+@@ -520,17 +634,26 @@ def sparse_attn_indexer(
                          cu_seqlen_ke,
                          clean_logits=False,
                      )

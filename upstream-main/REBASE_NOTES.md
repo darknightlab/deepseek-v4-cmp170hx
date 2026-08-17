@@ -24,10 +24,10 @@ files:
 Those two experimental feature groups were restored to the official-main
 implementation as a unit. Their conflict-coupled tests and the fork's benchmark
 artifacts are not carried in this production candidate. Three focused SM80
-kernel tests remain in the patch. The required constructor half of the SM80
-indexer fallback is retained separately: CUDA devices without DeepGEMM now
-pre-warm and use the Triton MQA kernels, without importing any query-sharding
-metadata. The first-layer MHC broadcast path likewise selects the existing
+kernel tests remain in the patch. The required constructor and forward halves
+of the SM80 indexer fallback are retained separately: CUDA devices without
+DeepGEMM pre-warm and explicitly dispatch prefill/decode logits to the Triton
+MQA kernels, without importing any query-sharding metadata. The first-layer MHC broadcast path likewise selects the existing
 TileLang prenorm GEMM when DeepGEMM is unavailable, matching the fallback
 already used by the other MHC pre paths. Its ragged SWA metadata builder also
 returns an empty FlashMLA scheduler plan, since the ROCm/Ampere Triton decode
