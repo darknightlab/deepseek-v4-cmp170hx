@@ -27,7 +27,9 @@ artifacts are not carried in this production candidate. Three focused SM80
 kernel tests remain in the patch. The required constructor half of the SM80
 indexer fallback is retained separately: CUDA devices without DeepGEMM now
 pre-warm and use the Triton MQA kernels, without importing any query-sharding
-metadata.
+metadata. The first-layer MHC broadcast path likewise selects the existing
+TileLang prenorm GEMM when DeepGEMM is unavailable, matching the fallback
+already used by the other MHC pre paths.
 
 The full build also exposed two native compile errors. The fork's persistent
 top-k rewrite indexed two histogram buffers with an out-of-scope `iter`

@@ -1,4 +1,4 @@
-From d99a0a3b435145e71d4596331ef90e755d567974 Mon Sep 17 00:00:00 2001
+From a28999f9eeffb2a4108021e6c6fddd3975334f82 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:31:36 +0800
 Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
@@ -26,6 +26,7 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  .../kernels/linear/gemv_triton.py             | 120 +++
  .../kernels/linear/scaled_mm/marlin.py        |  64 ++
  vllm/model_executor/kernels/mhc/ar_int8.py    | 175 ++++
+ vllm/model_executor/kernels/mhc/tilelang.py   |  34 +-
  vllm/model_executor/kernels/mhc/triton.py     | 124 +++
  .../layers/fused_moe/moe_align_block_size.py  | 120 ++-
  .../layers/fused_moe/router/gate_linear.py    |  18 +
@@ -71,7 +72,7 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  .../gpu/spec_decode/dspark/markov_argmax.py   | 451 ++++++++++
  vllm/v1/worker/gpu/spec_decode/speculator.py  |  16 +-
  vllm/v1/worker/gpu_model_runner.py            |   6 +-
- 67 files changed, 6387 insertions(+), 708 deletions(-)
+ 68 files changed, 6412 insertions(+), 717 deletions(-)
  create mode 100644 tests/kernels/attention/test_dsv4_fp8_sm80.py
  create mode 100644 tests/kernels/attention/test_mqa_logits_triton.py
  create mode 100644 tests/kernels/attention/test_triton_mla_sparse_kernel.py
@@ -4592,6 +4593,59 @@ index 0000000000..6667884b68
 +        ca._ptr, x, out_q, out_s, ca.buffer_ptrs[ca.rank], ca.max_size
 +    )
 +    return out_q.view(x.shape), out_s.view(x.shape[0], -1)
+diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
+index c3c773d07f..ca90334ecc 100644
+--- a/vllm/model_executor/kernels/mhc/tilelang.py
++++ b/vllm/model_executor/kernels/mhc/tilelang.py
+@@ -348,7 +348,13 @@ def mhc_pre_broadcast_tilelang(
+     residual_flat = residual
+     num_tokens = residual.shape[0]
+ 
+-    n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
++    from vllm.utils.deep_gemm import is_deep_gemm_supported
++
++    use_deep_gemm = is_deep_gemm_supported()
++    if use_deep_gemm:
++        n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
++    else:
++        n_splits = 1
+ 
+     residual_out = torch.empty(
+         num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
+@@ -369,15 +375,25 @@ def mhc_pre_broadcast_tilelang(
+         n_splits, num_tokens, dtype=torch.float32, device=residual.device
+     )
+ 
+-    from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
++    if use_deep_gemm:
++        from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
+ 
+-    tf32_hc_prenorm_gemm(
+-        residual_flat,
+-        fn_broadcast,
+-        gemm_out_mul,
+-        gemm_out_sqrsum,
+-        n_splits,
+-    )
++        tf32_hc_prenorm_gemm(
++            residual_flat,
++            fn_broadcast,
++            gemm_out_mul,
++            gemm_out_sqrsum,
++            n_splits,
++        )
++    else:
++        _tilelang_hc_prenorm_gemm(
++            residual_flat,
++            fn_broadcast,
++            gemm_out_mul,
++            gemm_out_sqrsum,
++            hidden_size,
++            1,
++        )
+     mhc_pre_big_fuse_broadcast_with_norm_tilelang(
+         gemm_out_mul,
+         gemm_out_sqrsum,
 diff --git a/vllm/model_executor/kernels/mhc/triton.py b/vllm/model_executor/kernels/mhc/triton.py
 index facb6813ca..077ab13397 100644
 --- a/vllm/model_executor/kernels/mhc/triton.py

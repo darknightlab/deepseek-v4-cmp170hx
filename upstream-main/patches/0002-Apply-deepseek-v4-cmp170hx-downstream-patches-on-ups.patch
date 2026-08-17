@@ -1,4 +1,4 @@
-From a256b085236360b34a693012e88e248266faddea Mon Sep 17 00:00:00 2001
+From 1093de917f4afd2400b2b5923c60ae1a8d4c1d2a Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:10:58 +0800
 Subject: [PATCH 2/2] Apply deepseek-v4-cmp170hx downstream patches on upstream
