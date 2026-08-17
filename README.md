@@ -49,6 +49,24 @@ This repo sits on top of that branch.
 > upstream's second force-push). Details and the honest numbers — including why a circulated
 > "+30%" claim does not reproduce — in [RESULTS](RESULTS.md#rebase-to-c3046d1-2026-08-13).
 
+### Official upstream patch queue (experimental)
+
+[`upstream-main/`](upstream-main/README.md) carries the haosdent SM80 work as a patch queue
+on top of a pinned official `vllm-project/vllm` main commit. This removes the long-term need
+to clone the force-pushed fork and includes newer upstream features such as bounded native
+disk KV offload. The queue applies cleanly in source-level checks, but has not yet completed
+the four-card correctness and performance suite, so `c3046d1` remains the recommended
+production base.
+
+Prepare a candidate checkout with:
+
+```bash
+./scripts/prepare-upstream-vllm.sh /opt/vllm-upstream
+```
+
+Because the haosdent ahead commit includes native `csrc/` changes, this path requires a full
+sm_80 source build. See the queue README for provenance, conflict policy, and required tests.
+
 ---
 
 ## Requirements
@@ -203,12 +221,14 @@ driven gains you nothing and risks damaging the contact.
 ## Repo layout
 
 ```
-patches/     7 patches against haosdent/vllm@dsv4-flash-a100 (f8ea5bb) — see patches/README.md
-docker/      container build (CUDA-devel base + venv, precompiled vLLM wheel)
-launch/      run-pp-dspark.sh (best config) and run-a100.sh (tensor-parallel variant)
-bench/       the 8 harnesses every number in RESULTS.md came from
-SETTINGS.md  every flag and why it has that value
-RESULTS.md   measured results, correctness testing, limits, measurement pitfalls
+patches/       patches against the legacy haosdent bases — see patches/README.md
+upstream-main/ official-main patch queue and rebase notes (experimental)
+scripts/       reproducible checkout preparation for the official-main queue
+docker/        container build (CUDA-devel base + full sm_80 source build)
+launch/        run-pp-dspark.sh (best config) and run-a100.sh (tensor-parallel variant)
+bench/         benchmark and correctness harnesses used by RESULTS.md
+SETTINGS.md    every flag and why it has that value
+RESULTS.md     measured results, correctness testing, limits, measurement pitfalls
 ```
 
 ## Contributing back

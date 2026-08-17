@@ -1,0 +1,673 @@
+From 1cb844a46d202fe63bb4272a84d1cc6345407166 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 02:10:58 +0800
+Subject: [PATCH 2/2] Apply deepseek-v4-cmp170hx downstream patches on upstream
+ main
+
+---
+ .../responses/test_function_call_parsing.py   |  26 +++
+ vllm/config/speculative.py                    |   3 +
+ vllm/entrypoints/openai/responses/protocol.py |  17 +-
+ .../layers/sparse_attn_indexer.py             | 150 ++++++++++++++++--
+ vllm/v1/structured_output/__init__.py         |  21 ++-
+ vllm/v1/structured_output/backend_xgrammar.py |  21 ++-
+ vllm/v1/worker/gpu/model_runner.py            |  14 +-
+ vllm/v1/worker/gpu/pp_utils.py                |  63 ++++++++
+ .../v1/worker/gpu/spec_decode/dspark/utils.py |  90 ++++++++++-
+ 9 files changed, 377 insertions(+), 28 deletions(-)
+
+diff --git a/tests/entrypoints/openai/responses/test_function_call_parsing.py b/tests/entrypoints/openai/responses/test_function_call_parsing.py
+index f90a641db7..ba6d91411f 100644
+--- a/tests/entrypoints/openai/responses/test_function_call_parsing.py
++++ b/tests/entrypoints/openai/responses/test_function_call_parsing.py
+@@ -377,3 +377,29 @@ def test_assistant_output_style_content_coerced():
+     assert item.content[0].annotations == []
+     assert item.status == "completed"
+     assert item.id.startswith("msg_")
++
++
++def test_assistant_output_style_content_without_type_coerced():
++    """Assistant output-message content without a top-level type is
++    normalized for clients that replay response output as conversation input."""
++    request_data = {
++        "model": "test-model",
++        "input": [
++            {
++                "role": "assistant",
++                "content": [{"type": "output_text", "text": "world"}],
++            },
++        ],
++    }
++
++    request = ResponsesRequest(**request_data)
++
++    item = request.input[0]
++    assert isinstance(item, ResponseOutputMessage), (
++        "Output-style assistant message without type should be coerced to "
++        f"ResponseOutputMessage, got {type(item)}"
++    )
++    assert item.content[0].text == "world"
++    assert item.content[0].annotations == []
++    assert item.status == "completed"
++    assert item.id.startswith("msg_")
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index a85b895d86..e11d2fd8be 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1150,6 +1150,9 @@ class SpeculativeConfig:
+                         self.target_parallel_config, self.draft_tensor_parallel_size
+                     )
+                 )
++                if self.method == "dspark":
++                    # The DSpark draft is built and run whole on the last PP rank.
++                    self.draft_parallel_config.pipeline_parallel_size = 1
+ 
+         if self.method != "dspark" and self.enable_adaptive_verification:
+             raise ValueError("Adaptive verification only supported with DSpark")
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+index ff3331612f..378f94080a 100644
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -526,6 +526,7 @@ class ResponsesRequest(OpenAIBaseModel):
+                 continue
+ 
+             item_type = item.get("type")
++            content = item.get("content")
+ 
+             if item_type == "function_call":
+                 try:
+@@ -549,8 +550,18 @@ class ResponsesRequest(OpenAIBaseModel):
+                     )
+                     processed_input.append(item)
+ 
+-            elif item_type == "message" and item.get("role") == "assistant":
+-                content = item.get("content")
++            elif item.get("role") == "assistant" and (
++                item_type == "message"
++                or (
++                    item_type is None
++                    and isinstance(content, list)
++                    and any(
++                        isinstance(part, dict)
++                        and part.get("type") in ("output_text", "refusal")
++                        for part in content
++                    )
++                )
++            ):
+                 if not isinstance(content, list):
+                     # String content is a valid EasyInputMessageParam,
+                     # do not coerce it to ResponseOutputMessage
+@@ -558,7 +569,7 @@ class ResponsesRequest(OpenAIBaseModel):
+                     continue
+ 
+                 original_item = item
+-                item = dict(item)
++                item = {**item, "type": "message"}
+                 if "id" not in item:
+                     item["id"] = f"msg_{random_uuid()}"
+                 if "status" not in item:
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index d94b377dbe..4d1e412fb6 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Custom Sparse Attention Indexer layers."""
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -43,6 +45,7 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+ 
+ # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
+ MXFP4_BLOCK_SIZE = 32
++_DSV4_LOGITS_ROW_CHUNK = int(os.environ.get("DSV4_LOGITS_ROW_CHUNK", "0"))
+ 
+ 
+ def _assert_cutedsl_dcp_merge_supported(
+@@ -124,6 +127,78 @@ def _merge_dcp_topk_global(
+     )
+ 
+ 
++def _top_k_per_row_prefill_torch(
++    logits: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++    topk_indices: torch.Tensor,
++    topk_tokens: int,
++) -> None:
++    """torch.topk fallback with ``top_k_per_row_prefill``'s output contract.
++
++    Ported from vllm-project/vllm PR #49897, which added this for SM12x. The
++    CUDA kernel's histogram path (taken by rows with more than ``topk_tokens``
++    candidates) can leave part of its dynamic-shared-memory output
++    uninitialized and copy it out as indices; downstream,
++    ``compute_global_topk_indices_and_lens`` treats any index ``>= 0`` as valid
++    and dereferences it into the KV block table, crashing with a CUDA illegal
++    memory access.
++
++    Enabled here for SM8x as well: on 4x CMP 170HX this reproduces as an
++    ``Xid 31 MMU Fault ... ACCESS_TYPE_VIRT_WRITE`` that kills a worker on
++    prefills above roughly 128k tokens, while 123k passes.
++
++    Select the top ``topk_tokens`` positions of ``logits[i, ks_i:ke_i)`` per
++    row, emit them relative to ``ks_i`` in ascending position order, and pad
++    rows with fewer candidates with ``-1`` (the kernel's short-row contract).
++    """
++    num_cols = logits.shape[1]
++    ks = cu_seqlen_ks.to(torch.long)[:, None]
++    cols = torch.arange(num_cols, device=logits.device)[None, :]
++    valid = (cols >= ks) & (cols < cu_seqlen_ke.to(torch.long)[:, None])
++    # logits is a per-chunk scratch buffer that is dead after top-k; mask it
++    # in place rather than materializing a masked copy.
++    logits.masked_fill_(~valid, float("-inf"))
++    k = min(topk_tokens, num_cols)
++    top_values, top_cols = logits.topk(k, dim=-1)
++    relative = (top_cols - ks).to(torch.int32)
++    # Downstream sparse-attention kernels iterate the selected KV positions in
++    # ascending order; emit position-sorted indices with the ``-1`` pads at the
++    # tail (torch.topk returns score order instead). Non-finite scores (rows
++    # shorter than ``topk_tokens``, or NaN logits) pad.
++    pad_sentinel = torch.iinfo(torch.int32).max
++    relative = torch.where(
++        top_values.isfinite(), relative, relative.new_full((), pad_sentinel)
++    )
++    relative, _ = relative.sort(dim=-1)
++    relative = torch.where(
++        relative == pad_sentinel, relative.new_full((), -1), relative
++    )
++    topk_indices[:, :k] = relative
++    if k < topk_tokens:
++        topk_indices[:, k:] = -1
++
++
++def _prefill_topk_needs_torch_fallback() -> bool:
++    """SM12x per PR #49897; SM8x added here (see _top_k_per_row_prefill_torch).
++
++    Set VLLM_DSV4_PREFILL_TOPK_TORCH=0 to force the CUDA kernel back on, or =1
++    to force the fallback on any architecture.
++    """
++    import os
++
++    forced = os.environ.get("VLLM_DSV4_PREFILL_TOPK_TORCH")
++    if forced is not None:
++        return forced == "1"
++    if not current_platform.is_cuda():
++        return False
++    return current_platform.is_device_capability_family(
++        120
++    ) or current_platform.has_device_capability(80) and not (
++        current_platform.has_device_capability(90)
++    )
++
++
+ @triton.jit
+ def _fused_indexer_q_rope_quant_kernel(
+     positions,
+@@ -496,6 +571,50 @@ def sparse_attn_indexer(
+                         cu_seqlen_ks,
+                         cu_seqlen_ke,
+                     )
++                elif _DSV4_LOGITS_ROW_CHUNK > 0 and dcp_world_size <= 1:
++                    # Cap the SM80 prefill logits transient at rows x context.
++                    step = _DSV4_LOGITS_ROW_CHUNK
++                    total_rows = q_slice_cast.shape[0]
++                    use_torch_topk = _prefill_topk_needs_torch_fallback()
++                    for row_start in range(0, total_rows, step):
++                        row_end = min(row_start + step, total_rows)
++                        q_scale_chunk = (
++                            q_scale_slice[row_start:row_end]
++                            if q_scale_slice is not None
++                            else None
++                        )
++                        chunk_logits = fp8_fp4_mqa_logits(
++                            (q_slice_cast[row_start:row_end], q_scale_chunk),
++                            (k_quant_cast, k_scale_cast),
++                            weights[
++                                chunk.token_start + row_start : chunk.token_start
++                                + row_end
++                            ],
++                            cu_seqlen_ks[row_start:row_end],
++                            cu_seqlen_ke[row_start:row_end],
++                            clean_logits=False,
++                        )
++                        if use_torch_topk:
++                            _top_k_per_row_prefill_torch(
++                                chunk_logits,
++                                cu_seqlen_ks[row_start:row_end],
++                                cu_seqlen_ke[row_start:row_end],
++                                topk_indices[row_start:row_end],
++                                topk_tokens,
++                            )
++                        else:
++                            ops.top_k_per_row_prefill(
++                                chunk_logits,
++                                cu_seqlen_ks[row_start:row_end],
++                                cu_seqlen_ke[row_start:row_end],
++                                topk_indices[row_start:row_end],
++                                row_end - row_start,
++                                chunk_logits.stride(0),
++                                chunk_logits.stride(1),
++                                topk_tokens,
++                            )
++                        del chunk_logits
++                    logits = q_slice_cast.new_empty((0, 0), dtype=torch.float32)
+                 else:
+                     logits = fp8_fp4_mqa_logits(
+                         (q_slice_cast, q_scale_slice),
+@@ -505,17 +624,26 @@ def sparse_attn_indexer(
+                         cu_seqlen_ke,
+                         clean_logits=False,
+                     )
+-                num_rows = logits.shape[0]
+-                ops.top_k_per_row_prefill(
+-                    logits,
+-                    cu_seqlen_ks,
+-                    cu_seqlen_ke,
+-                    topk_indices,
+-                    num_rows,
+-                    logits.stride(0),
+-                    logits.stride(1),
+-                    topk_tokens,
+-                )
++                if logits.shape[0] > 0:
++                    if _prefill_topk_needs_torch_fallback():
++                        _top_k_per_row_prefill_torch(
++                            logits,
++                            cu_seqlen_ks,
++                            cu_seqlen_ke,
++                            topk_indices,
++                            topk_tokens,
++                        )
++                    else:
++                        ops.top_k_per_row_prefill(
++                            logits,
++                            cu_seqlen_ks,
++                            cu_seqlen_ke,
++                            topk_indices,
++                            logits.shape[0],
++                            logits.stride(0),
++                            logits.stride(1),
++                            topk_tokens,
++                        )
+ 
+             _merge_dcp_topk_global(
+                 logits,
+diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
+index 5c1c650b8d..2249b29718 100644
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -366,8 +366,18 @@ class StructuredOutputManager:
+                 state_advancements = 0
+                 post_reasoning_end_in_window = False
+                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
++                # Probe speculative / draft tokens on a forked matcher when the
++                # backend supports it, so the live FSM is never advanced and
++                # rolled back. xgrammar's rollback corrupts structural-tag
++                # grammar state and terminates the request (#46249).
++                probe = (
++                    grammar.fork()
++                    if req_tokens and hasattr(grammar, "fork")
++                    else None
++                )
++                src = probe if probe is not None else grammar
+                 for i, token in enumerate(req_tokens):
+-                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
++                    self._fill_bitmasks(((src, cumulative_index, apply_bitmask),))
+                     advance_grammar = apply_bitmask
+                     if token == -1:
+                         apply_bitmask = False
+@@ -393,10 +403,11 @@ class StructuredOutputManager:
+                             apply_bitmask = True
+                             advance_grammar = False
+                             post_reasoning_end_in_window = True
+-                    if advance_grammar and not grammar.is_terminated():
+-                        accepted = grammar.accept_tokens(req_id, [token])
++                    if advance_grammar and not src.is_terminated():
++                        accepted = src.accept_tokens(req_id, [token])
+                         if accepted:
+-                            state_advancements += 1
++                            if probe is None:
++                                state_advancements += 1
+                         elif not post_reasoning_end_in_window:
+                             raise AssertionError(
+                                 (token, req_id, scheduled_spec_decode_tokens)
+@@ -416,7 +427,7 @@ class StructuredOutputManager:
+                     #   reasoning_ended is only persisted later by
+                     #   should_advance.
+                     bonus_apply = self.should_fill_bitmask(request) or apply_bitmask
+-                    self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))
++                    self._fill_bitmasks(((src, cumulative_index, bonus_apply),))
+                     cumulative_index += 1
+                 if state_advancements > 0:
+                     grammar.rollback(state_advancements)
+diff --git a/vllm/v1/structured_output/backend_xgrammar.py b/vllm/v1/structured_output/backend_xgrammar.py
+index a8c654ae68..9e3270aa51 100644
+--- a/vllm/v1/structured_output/backend_xgrammar.py
++++ b/vllm/v1/structured_output/backend_xgrammar.py
+@@ -186,17 +186,30 @@ class XgrammarGrammar(StructuredOutputGrammar):
+ 
+         Returns the prefix list of tokens that are accepted by the FSM.
+         """
++        # Probe on a forked matcher so the live FSM is never advanced or
++        # rolled back (xgrammar structural-tag rollback corrupts state).
++        probe = self.matcher.fork()
+         accepted_tokens = []
+         for token in tokens:
+-            if self.matcher.accept_token(token):
++            if probe.accept_token(token):
+                 accepted_tokens.append(token)
+             else:
+                 break
+-        if len(accepted_tokens) > 0:
+-            # Rollback the FSM to the initial state
+-            self.matcher.rollback(len(accepted_tokens))
+         return accepted_tokens
+ 
++    def fork(self) -> "XgrammarGrammar":
++        # Deep copy of the matcher state for probing draft / speculative
++        # tokens without ever advancing or rolling back the live FSM.
++        # xgrammar's rollback corrupts structural-tag grammar state
++        # (#46249), so we never roll back the real matcher.
++        forked = XgrammarGrammar(
++            vocab_size=self.vocab_size,
++            matcher=self.matcher.fork(),
++            ctx=self.ctx,
++        )
++        forked._is_terminated = self._is_terminated
++        return forked
++
+     def rollback(self, num_tokens: int) -> None:
+         self.matcher.rollback(num_tokens)
+         self.num_processed_tokens -= num_tokens
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index aff0c09cab..462396accc 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -247,7 +247,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
+                 # Drafting may require auxiliary hidden states from target model outputs
+                 self.use_aux_hidden_state_outputs = True
+-                if self.use_pp:
++                # DSpark runs wholly on the last PP rank; its draft tokens are relayed
++                # through PPHandler. Other auxiliary-state speculators remain
++                # unsupported.
++                if self.use_pp and self.speculative_config.method != "dspark":
+                     raise ValueError(
+                         f"{self.speculative_config.method} with pipeline parallel "
+                         "is not supported."
+@@ -952,7 +955,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if self.pp_handler is not None:
+             outputs = self.pp_handler.get_prev_sampled_outputs()
+             if outputs is not None:
++                draft_tokens = outputs.pop("draft_tokens", None)
++                idx_mapping = outputs["idx_mapping"]
+                 self.postprocess_sampled(**outputs)
++                if draft_tokens is not None:
++                    valid = idx_mapping >= 0
++                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
++                        valid
++                    ]
+ 
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+         for new_req_data in scheduler_output.scheduled_new_reqs:
+@@ -1842,6 +1852,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     mm_inputs=mm_inputs,
+                 )
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
++            if self.pp_handler is not None:
++                self.pp_handler.broadcast_draft(draft_tokens, input_batch)
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.record_confidences(
+                     self.speculator.draft_token_confidence_probs, input_batch
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 9b1786cbe4..38b45e45f1 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -30,6 +30,10 @@ class PendingRecv:
+     # Snapshot of slot generation counters at receive time, used to
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
++    # Spec decode: proposed draft tokens relayed from the last rank, scattered
++    # into the non-last rank's req_states.draft_tokens on consume. None when spec
++    # is off (max_sample_len == 1).
++    draft_tokens: torch.Tensor | None = None  # [num_reqs, max_sample_len - 1]
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+@@ -121,6 +125,7 @@ class PPHandler:
+             num_sampled=slot.num_sampled,
+             num_rejected=slot.num_rejected,
+             idx_mapping=idx_mapping,
++            draft_tokens=slot.draft_tokens,
+         )
+ 
+     def receive(self, input_batch: InputBatch) -> bool:
+@@ -149,12 +154,28 @@ class PPHandler:
+             torch.distributed.broadcast(
+                 combined, src=self.last_rank, group=self.broadcast_group
+             )
++            # Spec decode: 3rd broadcast on this group — the proposed draft tokens
++            # relayed by the last rank (matches broadcast_draft's order). NCCL
++            # matches by op order on the communicator; the deferred event covers it.
++            draft_tokens = None
++            if self.max_sample_len > 1:
++                draft_tokens = torch.empty(
++                    num_reqs,
++                    self.max_sample_len - 1,
++                    dtype=torch.int64,
++                    device=self.device,
++                )
++                torch.distributed.broadcast(
++                    draft_tokens, src=self.last_rank, group=self.broadcast_group
++                )
+             event = self.broadcast_stream.record_event()
+             num_sampled, num_rejected = combined.unbind(dim=0)
+             # Must record_stream since these were allocated on broadcast stream but
+             # later used on the main stream.
+             sampled_tokens.record_stream(self.main_stream)
+             combined.record_stream(self.main_stream)
++            if draft_tokens is not None:
++                draft_tokens.record_stream(self.main_stream)
+         self.queue[-1] = PendingRecv(
+             event,
+             sampled_tokens,
+@@ -164,6 +185,7 @@ class PPHandler:
+             input_batch.idx_mapping_np,
+             need_sampled_mask,
+             gen_at_receive_np,
++            draft_tokens,
+         )
+         return bool(need_sampled_mask.all())
+ 
+@@ -180,6 +202,22 @@ class PPHandler:
+             return
+ 
+         assert sampled_token_ids.dtype == torch.int64
++        # The receiver always posts a [num_reqs, max_sample_len] buffer, but under
++        # spec decode the sampler emits width 1 on any step with no draft tokens
++        # (prefill, first decode) and width (num_spec+1) only once rejection
++        # sampling has run. Pad to max_sample_len so the NCCL broadcast element
++        # count matches the receiver on EVERY step (an unpadded width-1 send vs a
++        # width-(num_spec+1) recv is a count mismatch that deadlocks the receiver).
++        # Trailing -1 columns are placeholders ignored by post_update, which
++        # advances each request by its per-request num_sampled valid count.
++        width = sampled_token_ids.shape[-1]
++        if width != self.max_sample_len:
++            assert width < self.max_sample_len
++            padded = sampled_token_ids.new_full(
++                (sampled_token_ids.shape[0], self.max_sample_len), -1
++            )
++            padded[:, :width] = sampled_token_ids
++            sampled_token_ids = padded
+ 
+         if current_platform.is_xpu():
+             self.main_stream.synchronize()
+@@ -197,3 +235,28 @@ class PPHandler:
+             )
+             for tensor in (sampled_token_ids, num_sampled, num_rejected):
+                 tensor.record_stream(self.broadcast_stream)
++
++    def broadcast_draft(
++        self, draft_tokens: torch.Tensor, input_batch: InputBatch
++    ) -> None:
++        """Relay the proposed draft tokens (spec decode) from the last rank to the
++        non-last ranks. Issued AFTER propose(), so it is the 3rd broadcast on this
++        group for the step (sampled, combined, draft) — matching the order in which
++        `receive` posts its recvs. Gated identically to `broadcast` so op counts
++        stay matched across ranks. Without this, non-last ranks verify against a
++        zero-init req_states.draft_tokens (near-zero acceptance, corrupt output)."""
++        assert self.is_last_rank
++        if self.max_sample_len <= 1:
++            return
++        if compute_need_sampled_mask(input_batch) is None:
++            # No request needs sampled outputs next step; `broadcast` skipped too,
++            # so skip here to keep the per-step broadcast count matched.
++            return
++        draft_tokens = draft_tokens.to(torch.int64).contiguous()
++        with torch.cuda.stream(self.broadcast_stream):
++            # wait_stream so the side-stream broadcast sees propose()'s output.
++            self.broadcast_stream.wait_stream(self.main_stream)
++            torch.distributed.broadcast(
++                draft_tokens, src=self.last_rank, group=self.broadcast_group
++            )
++            draft_tokens.record_stream(self.broadcast_stream)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+index 78ae392132..8fe728856a 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -1,16 +1,81 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import json
++import os
++
++import torch
+ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig, replace
+ from vllm.distributed.parallel_state import get_pp_group
++from vllm.logger import init_logger
+ from vllm.model_executor.model_loader import get_model
+ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+     _should_share,
+     get_target_lm_head,
+ )
+ 
++logger = init_logger(__name__)
++
++# Checkpoint names the token embedding can appear under, most specific first.
++_EMBED_KEYS = (
++    "embed.weight",
++    "model.embed_tokens.weight",
++    "model.embed.weight",
++    "embed_tokens.weight",
++)
++
++
++def _has_real_weight(module) -> bool:
++    """True for a materialised layer; False for PPMissingLayer / None.
++
++    Under pipeline parallelism vLLM replaces the layers a rank does not own with
++    PPMissingLayer, which has no ``weight``. Aliasing one of those into the draft
++    silently produces a no-op layer rather than an error, so check explicitly.
++    """
++    return module is not None and getattr(module, "weight", None) is not None
++
++
++def _load_embed_from_checkpoint(embed: nn.Module, model_path: str) -> None:
++    """Fill the draft's own token embedding straight from the checkpoint.
++
++    Only needed under PP: the drafter runs on the LAST pipeline rank, but the
++    target's ``embed_tokens`` lives on the FIRST, so there is nothing local to
++    alias. Reading the one tensor off disk (~1 GB) avoids adding a cross-rank
++    collective to model load, which would have to be ordered against every other
++    rank's initialisation.
++    """
++    from safetensors import safe_open
++
++    index_path = os.path.join(model_path, "model.safetensors.index.json")
++    key = shard = None
++    if os.path.exists(index_path):
++        with open(index_path) as f:
++            weight_map = json.load(f)["weight_map"]
++        for cand in _EMBED_KEYS:
++            if cand in weight_map:
++                key, shard = cand, os.path.join(model_path, weight_map[cand])
++                break
++    if key is None:
++        raise RuntimeError(
++            f"DSpark+PP: could not find a token-embedding tensor in {index_path}; "
++            f"looked for {_EMBED_KEYS}. The draft needs its own copy because the "
++            "target's embedding lives on PP rank 0."
++        )
++
++    with safe_open(shard, framework="pt") as f:
++        w = f.get_tensor(key)
++    with torch.no_grad():
++        # VocabParallelEmbedding pads the vocab dimension, so copy into the
++        # leading rows rather than assigning the whole tensor.
++        embed.weight.data[: w.shape[0]].copy_(
++            w.to(dtype=embed.weight.dtype, device=embed.weight.device)
++        )
++    logger.info(
++        "DSpark+PP: loaded draft token embedding %s from key %r", tuple(w.shape), key
++    )
++
+ 
+ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+     speculative_config = vllm_config.speculative_config
+@@ -52,8 +117,13 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+             vllm_config=draft_vllm_config, model_config=draft_model_config
+         )
+ 
+-    if get_pp_group().world_size != 1:
+-        raise NotImplementedError("DSpark does not support pipeline parallelism.")
++    # NOTE(pp): DSpark used to hard-refuse pipeline parallelism here. It works
++    # provided (a) the drafter is built on the last PP rank only -- the model
++    # runner already does exactly that -- and (b) the draft can still reach a
++    # token embedding and an lm_head. For DeepSeek-V4 the aux-hidden-state taps
++    # (dspark_target_layer_ids = [40,41,42] of 43 layers) and lm_head both land
++    # on that same last rank, so only the embedding must be sourced separately.
++    is_pp = get_pp_group().world_size != 1
+ 
+     target_language_model = (
+         target_model.get_language_model()
+@@ -65,20 +135,32 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+ 
+     target_embed = getattr(target_inner, "embed_tokens", None)
+     draft_embed = getattr(draft_inner, "embed_tokens", None)
+-    if target_embed is not None and _should_share(
++    if _has_real_weight(target_embed) and _should_share(
+         draft_model, "has_own_embed_tokens", draft_embed, target_embed
+     ):
+         if draft_embed is not None:
+             del draft_inner.embed_tokens
+         draft_inner.embed_tokens = target_embed
++    elif is_pp and draft_embed is not None:
++        # PP: the target's embedding is a PPMissingLayer on this rank. Keep the
++        # draft's own module and populate it from the checkpoint -- the draft's
++        # load_weights() only consumes mtp.* tensors, so it is still empty here.
++        _load_embed_from_checkpoint(draft_embed, draft_model_config.model)
+ 
+     target_lm_head = get_target_lm_head(target_model, target_language_model)
+     draft_lm_head = getattr(draft_model, "lm_head", None)
+-    if target_lm_head is not None and _should_share(
++    if _has_real_weight(target_lm_head) and _should_share(
+         draft_model, "has_own_lm_head", draft_lm_head, target_lm_head
+     ):
+         if draft_lm_head is not None:
+             del draft_model.lm_head
+         draft_model.lm_head = target_lm_head
++    elif is_pp and not _has_real_weight(target_lm_head):
++        # Should not happen: the drafter runs on the last rank, which owns
++        # lm_head. Fail loudly rather than silently drafting through a no-op.
++        raise RuntimeError(
++            "DSpark+PP: the target lm_head is not materialised on this rank. The "
++            "drafter is expected to run on the last pipeline rank."
++        )
+ 
+     return draft_model
