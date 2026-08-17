@@ -1,4 +1,4 @@
-From 1093de917f4afd2400b2b5923c60ae1a8d4c1d2a Mon Sep 17 00:00:00 2001
+From 40c30b84e826685c435362ad6029f7bce22adedc Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:10:58 +0800
 Subject: [PATCH 2/2] Apply deepseek-v4-cmp170hx downstream patches on upstream
@@ -6,15 +6,20 @@ Subject: [PATCH 2/2] Apply deepseek-v4-cmp170hx downstream patches on upstream
 
 ---
  .../responses/test_function_call_parsing.py   |  26 +++
+ .../v1/simple_kv_offload/test_disk_backend.py |  45 ++++++
  vllm/config/speculative.py                    |   3 +
  vllm/entrypoints/openai/responses/protocol.py |  17 +-
  .../layers/sparse_attn_indexer.py             | 150 ++++++++++++++++--
+ vllm/v1/simple_kv_offload/cuda_mem_ops.py     |  28 ++--
+ vllm/v1/simple_kv_offload/disk_backend.py     |  77 +++++----
+ vllm/v1/simple_kv_offload/worker.py           |  10 +-
  vllm/v1/structured_output/__init__.py         |  21 ++-
  vllm/v1/structured_output/backend_xgrammar.py |  21 ++-
  vllm/v1/worker/gpu/model_runner.py            |  14 +-
  vllm/v1/worker/gpu/pp_utils.py                |  63 ++++++++
  .../v1/worker/gpu/spec_decode/dspark/utils.py |  90 ++++++++++-
- 9 files changed, 377 insertions(+), 28 deletions(-)
+ 13 files changed, 493 insertions(+), 72 deletions(-)
+ create mode 100644 tests/v1/simple_kv_offload/test_disk_backend.py
 
 diff --git a/tests/entrypoints/openai/responses/test_function_call_parsing.py b/tests/entrypoints/openai/responses/test_function_call_parsing.py
 index f90a641db7..ba6d91411f 100644
@@ -50,6 +55,57 @@ index f90a641db7..ba6d91411f 100644
 +    assert item.content[0].annotations == []
 +    assert item.status == "completed"
 +    assert item.id.startswith("msg_")
+diff --git a/tests/v1/simple_kv_offload/test_disk_backend.py b/tests/v1/simple_kv_offload/test_disk_backend.py
+new file mode 100644
+index 0000000000..33d94616f6
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_disk_backend.py
+@@ -0,0 +1,45 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch
++
++from vllm.v1.simple_kv_offload import cuda_mem_ops
++from vllm.v1.simple_kv_offload.disk_backend import (
++    _alloc_aligned,
++    aligned_disk_slot_bytes,
++)
++
++
++def test_aligned_disk_slot_bytes():
++    assert aligned_disk_slot_bytes(4096) == 4096
++    assert aligned_disk_slot_bytes(4097) == 8192
++    assert aligned_disk_slot_bytes(332928) == 335872
++    assert aligned_disk_slot_bytes(299520) == 303104
++
++
++def test_aligned_pool_rows():
++    stride = aligned_disk_slot_bytes(332928)
++    pool = _alloc_aligned(3, stride)
++    assert pool.data_ptr() % 4096 == 0
++    assert pool.stride(0) == stride
++    assert pool[1].data_ptr() % 4096 == 0
++
++
++def test_batch_memcpy_supports_distinct_block_strides(monkeypatch):
++    monkeypatch.setattr(cuda_mem_ops, "_batch_memcpy_fn", object())
++
++    src = torch.empty((2, 13), dtype=torch.int8)
++    backing = torch.empty((2, 16), dtype=torch.int8)
++    dst = backing.as_strided((2, 13), (16, 1))
++
++    class FakeStream:
++        cuda_stream = 0
++
++    params = cuda_mem_ops.build_params(
++        {"cache": src},
++        {"cache": dst},
++        FakeStream(),  # type: ignore[arg-type]
++    )
++    assert params.src_strides.tolist() == [13]
++    assert params.dst_strides.tolist() == [16]
++    assert params.copy_sizes.tolist() == [13]
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
 index a85b895d86..e11d2fd8be 100644
 --- a/vllm/config/speculative.py
@@ -295,6 +351,255 @@ index e147edaf37..0ea500ab5b 100644
  
              _merge_dcp_topk_global(
                  logits,
+diff --git a/vllm/v1/simple_kv_offload/cuda_mem_ops.py b/vllm/v1/simple_kv_offload/cuda_mem_ops.py
+index 69b1677e0a..ecc3c1fc08 100644
+--- a/vllm/v1/simple_kv_offload/cuda_mem_ops.py
++++ b/vllm/v1/simple_kv_offload/cuda_mem_ops.py
+@@ -110,7 +110,9 @@ def _resolve_batch_memcpy():
+ class BatchMemcpyParams(NamedTuple):
+     src_bases: np.ndarray  # [num_layers] uint64 — data_ptr per layer
+     dst_bases: np.ndarray  # [num_layers] uint64
+-    bpb: np.ndarray  # [num_layers] uint64 — bytes per block
++    src_strides: np.ndarray  # [num_layers] uint64 — bytes between source blocks
++    dst_strides: np.ndarray  # [num_layers] uint64 — bytes between destination blocks
++    copy_sizes: np.ndarray  # [num_layers] uint64 — payload bytes per block
+     num_layers: int
+     # CUDA only: one attributes entry carrying srcAccessOrder. Unused on ROCm
+     # (7.2.1 or 7.2.2) because the current runtime rejects numAttrs > 0.
+@@ -136,20 +138,28 @@ def build_params(
+     src_tensors = list(src_caches.values())
+     dst_tensors = list(dst_caches.values())
+ 
+-    src_bases, dst_bases, bpb = [], [], []
++    src_bases, dst_bases = [], []
++    src_strides, dst_strides, copy_sizes = [], [], []
+     for s, d in zip(src_tensors, dst_tensors):
+-        s_bpb = s.stride(0) * s.element_size()
+-        assert s_bpb == d.stride(0) * d.element_size()
++        src_stride = s.stride(0) * s.element_size()
++        dst_stride = d.stride(0) * d.element_size()
++        src_size = s[0].numel() * s.element_size()
++        dst_size = d[0].numel() * d.element_size()
++        assert src_size == dst_size
+         src_bases.append(s.data_ptr())
+         dst_bases.append(d.data_ptr())
+-        bpb.append(s_bpb)
++        src_strides.append(src_stride)
++        dst_strides.append(dst_stride)
++        copy_sizes.append(src_size)
+ 
+     attrs = _CUmemcpyAttributes(srcAccessOrder=src_access_order)
+ 
+     return BatchMemcpyParams(
+         src_bases=np.array(src_bases, dtype=np.uint64),
+         dst_bases=np.array(dst_bases, dtype=np.uint64),
+-        bpb=np.array(bpb, dtype=np.uint64),
++        src_strides=np.array(src_strides, dtype=np.uint64),
++        dst_strides=np.array(dst_strides, dtype=np.uint64),
++        copy_sizes=np.array(copy_sizes, dtype=np.uint64),
+         num_layers=len(src_tensors),
+         attrs=attrs,
+         attrs_idx=ctypes.c_size_t(0),
+@@ -172,12 +182,12 @@ def copy_blocks(
+     dst_ids = np.array(dst_block_ids, dtype=np.uint64)
+ 
+     src_all = (
+-        params.src_bases[:, None] + src_ids[None, :] * params.bpb[:, None]
++        params.src_bases[:, None] + src_ids[None, :] * params.src_strides[:, None]
+     ).ravel()
+     dst_all = (
+-        params.dst_bases[:, None] + dst_ids[None, :] * params.bpb[:, None]
++        params.dst_bases[:, None] + dst_ids[None, :] * params.dst_strides[:, None]
+     ).ravel()
+-    sz_all = np.repeat(params.bpb, n)
++    sz_all = np.repeat(params.copy_sizes, n)
+     total = n * params.num_layers
+ 
+     # ROCm 7.2.1/7.2.2 rejects any call with numAttrs>0 (hipMemcpyBatchAsync
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index f48dfd46bb..9b2b453686 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -33,6 +33,11 @@ O_DIRECT = getattr(os, "O_DIRECT", 0)
+ _ALIGNMENT = 4096
+ 
+ 
++def aligned_disk_slot_bytes(payload_bytes: int) -> int:
++    """Return the O_DIRECT-aligned on-disk stride for one KV block."""
++    return (payload_bytes + _ALIGNMENT - 1) // _ALIGNMENT * _ALIGNMENT
++
++
+ def _alloc_aligned(num_slots: int, bpb: int) -> torch.Tensor:
+     """Allocate a staging buffer whose base address is O_DIRECT aligned.
+ 
+@@ -71,6 +76,9 @@ class DiskBackend:
+         self._fd: int = -1
+         self._disk_path: str = ""
+         self._total_block_bytes: int = 0
++        self._disk_slot_bytes: int = 0
++        self._store_io_buffer: torch.Tensor | None = None
++        self._load_io_buffer: torch.Tensor | None = None
+         self._store_buffer_caches: dict[str, torch.Tensor] = {}
+         self._load_buffer_caches: dict[str, torch.Tensor] = {}
+         self._store_slot_views: list[list[memoryview]] = []
+@@ -98,36 +106,40 @@ class DiskBackend:
+         self._per_tensor_bpb = [
+             t.stride(0) * t.element_size() for t in gpu_caches.values()
+         ]
+-
+-        assert total_block_bytes % _ALIGNMENT == 0, (
+-            f"total_block_bytes={total_block_bytes} not aligned to {_ALIGNMENT}"
++        assert sum(self._per_tensor_bpb) == total_block_bytes
++        self._disk_slot_bytes = aligned_disk_slot_bytes(total_block_bytes)
++
++        # One aligned contiguous row per buffer slot. Tensor-shaped views point
++        # into the payload prefix while the row tail supplies O_DIRECT padding.
++        # CUDA DMA uses the views' padded row stride but copies only each
++        # tensor's real bytes; disk IO reads/writes the whole aligned row.
++        self._store_io_buffer = _alloc_aligned(
++            num_buffer_slots, self._disk_slot_bytes
+         )
++        self._load_io_buffer = _alloc_aligned(num_buffer_slots, self._disk_slot_bytes)
++        pin_tensor(self._store_io_buffer)
++        pin_tensor(self._load_io_buffer)
+ 
+-        # Separate buffer pools for store and load threads
+         self._store_buffer_caches = {}
+         self._load_buffer_caches = {}
+-        for name, gpu_t in gpu_caches.items():
+-            bpb = gpu_t.stride(0) * gpu_t.element_size()
+-            store_buf = _alloc_aligned(num_buffer_slots, bpb)
+-            pin_tensor(store_buf)
+-            self._store_buffer_caches[name] = store_buf
+-            load_buf = _alloc_aligned(num_buffer_slots, bpb)
+-            pin_tensor(load_buf)
+-            self._load_buffer_caches[name] = load_buf
+-
+-        # Pre-built iovec views per slot (avoid per-transfer .numpy() calls)
++        offset = 0
++        for name, bpb in zip(self._tensor_names, self._per_tensor_bpb):
++            size = (num_buffer_slots, bpb)
++            stride = (self._disk_slot_bytes, 1)
++            self._store_buffer_caches[name] = self._store_io_buffer.as_strided(
++                size, stride, offset
++            )
++            self._load_buffer_caches[name] = self._load_io_buffer.as_strided(
++                size, stride, offset
++            )
++            offset += bpb
++
+         self._store_slot_views = [
+-            [
+-                memoryview(self._store_buffer_caches[name][slot].numpy())
+-                for name in self._tensor_names
+-            ]
++            [memoryview(self._store_io_buffer[slot].numpy())]
+             for slot in range(num_buffer_slots)
+         ]
+         self._load_slot_views = [
+-            [
+-                memoryview(self._load_buffer_caches[name][slot].numpy())
+-                for name in self._tensor_names
+-            ]
++            [memoryview(self._load_io_buffer[slot].numpy())]
+             for slot in range(num_buffer_slots)
+         ]
+ 
+@@ -157,15 +169,16 @@ class DiskBackend:
+             flags |= O_DIRECT
+         self._fd = os.open(disk_path, flags, 0o600)
+         self._disk_path = disk_path
+-        os.ftruncate(self._fd, num_disk_slots * total_block_bytes)
++        os.ftruncate(self._fd, num_disk_slots * self._disk_slot_bytes)
+ 
+         logger.info(
+-            "DiskBackend: path=%s, slots=%d, total=%.2f GB, buf=%dx%d bytes"
+-            " (page_cache=%s)",
++            "DiskBackend: path=%s, slots=%d, total=%.2f GB, "
++            "buf=%dx%d bytes, payload=%d bytes (page_cache=%s)",
+             disk_path,
+             num_disk_slots,
+-            (num_disk_slots * total_block_bytes) / (1024**3),
++            (num_disk_slots * self._disk_slot_bytes) / (1024**3),
+             num_buffer_slots,
++            self._disk_slot_bytes,
+             total_block_bytes,
+             use_page_cache,
+         )
+@@ -250,17 +263,17 @@ class DiskBackend:
+ 
+     def _writev_slot(self, buf_slot: int, file_offset: int) -> None:
+         written = os.pwritev(self._fd, self._store_slot_views[buf_slot], file_offset)
+-        if written < self._total_block_bytes:
++        if written < self._disk_slot_bytes:
+             raise OSError(
+-                f"Short write: expected {self._total_block_bytes} bytes, "
++                f"Short write: expected {self._disk_slot_bytes} bytes, "
+                 f"wrote {written}"
+             )
+ 
+     def _readv_slot(self, buf_slot: int, file_offset: int) -> None:
+         bytes_read = os.preadv(self._fd, self._load_slot_views[buf_slot], file_offset)
+-        if bytes_read < self._total_block_bytes:
++        if bytes_read < self._disk_slot_bytes:
+             raise OSError(
+-                f"Short read: expected {self._total_block_bytes} bytes, "
++                f"Short read: expected {self._disk_slot_bytes} bytes, "
+                 f"read {bytes_read}"
+             )
+ 
+@@ -304,7 +317,7 @@ class DiskBackend:
+             copy_blocks([gpu_blk], [buf_slot], self._store_params)
+             ev = torch.Event()
+             ev.record(stream)
+-            pending[buf_slot] = (ev, disk_slot * self._total_block_bytes)
++            pending[buf_slot] = (ev, disk_slot * self._disk_slot_bytes)
+ 
+         for slot, last in enumerate(pending):
+             if last is not None:
+@@ -328,7 +341,7 @@ class DiskBackend:
+             if prev is not None:
+                 prev.synchronize()
+ 
+-            self._readv_slot(buf_slot, disk_slot * self._total_block_bytes)
++            self._readv_slot(buf_slot, disk_slot * self._disk_slot_bytes)
+ 
+             copy_blocks([buf_slot], [gpu_blk], self._load_params)
+             ev = torch.Event()
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index e519bca261..6b16006786 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -11,7 +11,10 @@ from vllm.logger import init_logger
+ from vllm.utils.torch_utils import PIN_MEMORY
+ from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+ from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+-from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
++from vllm.v1.simple_kv_offload.disk_backend import (
++    DiskBackend,
++    aligned_disk_slot_bytes,
++)
+ from vllm.v1.simple_kv_offload.metadata import (
+     SimpleCPUOffloadMetadata,
+     SimpleCPUOffloadWorkerMetadata,
+@@ -174,14 +177,15 @@ class SimpleCPUOffloadWorker:
+         total_bytes_per_block: int,
+         device: torch.device,
+     ) -> None:
+-        num_disk_slots = max(1, self.disk_capacity_bytes // total_bytes_per_block)
++        disk_slot_bytes = aligned_disk_slot_bytes(total_bytes_per_block)
++        num_disk_slots = max(1, self.disk_capacity_bytes // disk_slot_bytes)
+         self.num_cpu_blocks = num_disk_slots
+ 
+         logger.info(
+             "SimpleCPUOffloadWorker [DISK]: %d tensors, %d disk slots (%.2f GB)",
+             len(unique_gpu_caches),
+             num_disk_slots,
+-            (num_disk_slots * total_bytes_per_block) / (1024**3),
++            (num_disk_slots * disk_slot_bytes) / (1024**3),
+         )
+ 
+         assert self.disk_path is not None
 diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
 index 5c1c650b8d..2249b29718 100644
 --- a/vllm/v1/structured_output/__init__.py

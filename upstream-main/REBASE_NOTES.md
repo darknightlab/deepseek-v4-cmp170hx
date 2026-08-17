@@ -90,7 +90,10 @@ against the official indexer flow: it row-chunks `fp8_fp4_mqa_logits` without
 requiring fork query-sharding metadata. Patches 0002 and 0004 were manually
 relocated to the current `SpeculativeConfig` and GPU model-runner structure
 without changing their DSpark+PP behavior. Patch 0001 remains omitted because
-its guard was already upstream.
+its guard was already upstream. The disk backend now stores arbitrary PP KV
+payload sizes in 4096-byte-aligned slot rows: GPU DMA copies only the real
+payload, while O_DIRECT reads and writes the padded stride and capacity is
+bounded using that physical stride.
 
 This is a source-level rebase, not a hardware certification. The SM80 backend
 selection and software FP8 encoding are now source-consistent, but only a full
