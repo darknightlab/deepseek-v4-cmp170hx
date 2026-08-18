@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 14:56:07 +0800
+Subject: [PATCH] experiment(mhc): restore SM8x prenorm cuBLAS path
+
+
+diff --git a/tests/kernels/test_mhc_kernels.py b/tests/kernels/test_mhc_kernels.py
+index 2bdce9f..32532ad 100644
+--- a/tests/kernels/test_mhc_kernels.py
++++ b/tests/kernels/test_mhc_kernels.py
+@@ -160,16 +160,25 @@ def test_mhc_pre_tilelang(num_tokens, hidden_size, hc_mult):
+         (512, 1280),
+         (2048, 1280),
+         (1, 4096),
++        (31, 4096),
++        (32, 4096),
+         (64, 4096),
+         (512, 4096),
+         (2048, 4096),
+         (1, 7168),
++        (31, 7168),
++        (32, 7168),
+         (64, 7168),
+         (512, 7168),
+         (2048, 7168),
+     ],
+ )
+ def test_hc_prenorm_gemm_tilelang(num_tokens, hidden_size):
++    from vllm.model_executor.kernels.mhc.tilelang import (
++        _PRENORM_SMALL_T,
++        _PRENORM_USE_CUBLAS,
++    )
++
+     torch.set_default_device(DEVICE)
+     set_random_seed(0)
+ 
+@@ -185,7 +194,11 @@ def test_hc_prenorm_gemm_tilelang(num_tokens, hidden_size):
+     _torch_hc_prenorm_gemm(x, fn, out_ref, sqrsum_ref)
+     _tilelang_hc_prenorm_gemm(x, fn, out, sqrsum, hidden_size, hc_mult)
+ 
+-    torch.testing.assert_close(out, out_ref, atol=1e-5, rtol=1e-4)
++    if _PRENORM_USE_CUBLAS and num_tokens >= _PRENORM_SMALL_T:
++        scale = float(out_ref.abs().max())
++        torch.testing.assert_close(out, out_ref, atol=5e-3 * scale, rtol=5e-3)
++    else:
++        torch.testing.assert_close(out, out_ref, atol=1e-5, rtol=1e-4)
+     torch.testing.assert_close(sqrsum, sqrsum_ref, atol=8.0, rtol=5e-4)
+ 
+ 
+diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
+index ca90334..959f6a3 100644
+--- a/vllm/model_executor/kernels/mhc/tilelang.py
++++ b/vllm/model_executor/kernels/mhc/tilelang.py
+@@ -2,9 +2,19 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import torch
+ 
++from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ 
++# The c3046d1 SM80 baseline measured cuBLAS at 17.4 us versus 31.8 us for
++# TileLang at T=64, and 85 us versus 442 us at T=2048. TileLang still wins on
++# launch latency below this crossover.
++_PRENORM_SMALL_T = 32
++_PRENORM_USE_CUBLAS = current_platform.is_cuda() and (
++    current_platform.get_device_capability()[0] == 8
++)
++
++
+ def _torch_hc_prenorm_gemm(
+     x: torch.Tensor,
+     fn: torch.Tensor,
+@@ -40,24 +50,10 @@ def _tilelang_hc_prenorm_gemm(
+     assert x.shape[1] % n_splits == 0
+     assert (x.shape[1] // n_splits) % n_thr == 0
+     use_default_config = tile_n == 12 and n_thr == 512
+-    if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
+-        hc_prenorm_gemm_block_m_tilelang(
+-            x,
+-            fn,
+-            out,
+-            sqrsum,
+-            hidden_size,
+-            hc_mult,
+-            fn.shape[0],
+-            n_thr,
+-            tile_n,
+-            2,
+-        )
+-        return
+     if (
+         n_splits == 1
+         and use_default_config
+-        and x.shape[0] < 128
++        and x.shape[0] < _PRENORM_SMALL_T
+         and x.shape[1] % 1024 == 0
+     ):
+         hc_prenorm_gemm_tilelang(
+@@ -73,6 +69,25 @@ def _tilelang_hc_prenorm_gemm(
+             n_splits,
+         )
+         return
++    if n_splits == 1 and x.dtype == torch.bfloat16 and _PRENORM_USE_CUBLAS:
++        from vllm.model_executor.kernels.mhc.triton import hc_prenorm_gemm_cublas
++
++        hc_prenorm_gemm_cublas(x, fn, out, sqrsum)
++        return
++    if n_splits == 1 and use_default_config and x.shape[0] >= 1024:
++        hc_prenorm_gemm_block_m_tilelang(
++            x,
++            fn,
++            out,
++            sqrsum,
++            hidden_size,
++            hc_mult,
++            fn.shape[0],
++            n_thr,
++            tile_n,
++            2,
++        )
++        return
+     hc_prenorm_gemm_tilelang(
+         x,
+         fn,
+diff --git a/vllm/model_executor/kernels/mhc/triton.py b/vllm/model_executor/kernels/mhc/triton.py
+index facb681..cccbb64 100644
+--- a/vllm/model_executor/kernels/mhc/triton.py
++++ b/vllm/model_executor/kernels/mhc/triton.py
+@@ -8,6 +8,56 @@ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ 
++@triton.jit
++def _row_sqrsum_kernel(
++    x_ptr,
++    out_ptr,
++    stride_row,
++    K,
++    BLOCK_K: tl.constexpr,
++):
++    """Compute one fp32 square-sum per input row."""
++    row = tl.program_id(0)
++    offs = tl.arange(0, BLOCK_K)
++    acc = tl.zeros([BLOCK_K], dtype=tl.float32)
++    for k0 in range(0, K, BLOCK_K):
++        x = tl.load(
++            x_ptr + row * stride_row + k0 + offs,
++            mask=k0 + offs < K,
++            other=0.0,
++            eviction_policy="evict_first",
++        ).to(tl.float32)
++        acc += x * x
++    tl.store(out_ptr + row, tl.sum(acc))
++
++
++def hc_prenorm_gemm_cublas(
++    x: Tensor,
++    fn: Tensor,
++    out: Tensor,
++    sqrsum: Tensor,
++) -> None:
++    """Run the large-token mHC prenorm projection through BF16 cuBLAS."""
++    assert out.shape[0] == 1
++    assert sqrsum.shape[0] == 1
++
++    fn_bf16 = getattr(fn, "_hc_prenorm_bf16", None)
++    if fn_bf16 is None:
++        fn_bf16 = fn.to(torch.bfloat16)
++        fn._hc_prenorm_bf16 = fn_bf16
++
++    num_rows, k = x.shape
++    out[0].copy_(x @ fn_bf16.t())
++    _row_sqrsum_kernel[(num_rows,)](
++        x,
++        sqrsum[0],
++        x.stride(0),
++        k,
++        BLOCK_K=1024,
++        num_warps=4,
++    )
++
++
+ @triton.jit
+ def _rmsnorm_nw_kernel(
+     x_ptr,
+-- 
+2.55.0
+

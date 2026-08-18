@@ -42,7 +42,7 @@ fi
 SERIES_FILE="$PATCH_DIR/series/$VLLM_FORK_PERFORMANCE_PROFILE.txt"
 if [[ ! -f "$SERIES_FILE" ]]; then
     echo "ERROR: unknown performance profile: $VLLM_FORK_PERFORMANCE_PROFILE" >&2
-    echo "Expected one of: none, sm8x, verified, all." >&2
+    echo "Expected one of: $(find "$PATCH_DIR/series" -maxdepth 1 -type f -name '*.txt' -printf '%f\n' | sed 's/\.txt$//' | sort | paste -sd, -)." >&2
     exit 1
 fi
 

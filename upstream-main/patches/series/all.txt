@@ -12,6 +12,7 @@ general/0005-hierarchical-allreduce.patch
 general/0006-local-argmax.patch
 sm8x/0005-sparse-kv-gather.patch
 sm8x/0006-compressor-warps.patch
+experimental-sm8x/0004-mhc-prenorm-cublas.patch
 general/0007-multistream-control.patch
 experimental-sm8x/0002-marlin-occupancy.patch
 experimental-general/0001-cudagraph-pad-up.patch

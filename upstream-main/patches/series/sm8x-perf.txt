@@ -1,0 +1,9 @@
+core/0001-sm8x-correctness.patch
+sm8x/0001-indexer-mqa.patch
+sm8x/0002-marlin-fp8-dequant.patch
+sm8x/0003-router-gemv.patch
+sm8x/0004-custom-ar-crossover.patch
+sm8x/0005-sparse-kv-gather.patch
+sm8x/0006-compressor-warps.patch
+experimental-sm8x/0004-mhc-prenorm-cublas.patch
+downstream/0001-170hx-serving.patch

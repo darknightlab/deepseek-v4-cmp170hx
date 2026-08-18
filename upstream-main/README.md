@@ -16,6 +16,10 @@ order.
 # Default: SM80/SM86 correctness and hardware-specific tuning + downstream
 ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm8x
 
+# SM8x baseline plus only the c3046d1/12810046 prenorm cuBLAS optimization
+VLLM_FORK_PERFORMANCE_PROFILE=sm8x-perf \
+  ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm8x-perf
+
 # Minimal SM8x execution + downstream, no performance patches
 VLLM_FORK_PERFORMANCE_PROFILE=none \
   ./scripts/prepare-upstream-vllm.sh /opt/vllm-minimal
@@ -33,6 +37,7 @@ VLLM_FORK_PERFORMANCE_PROFILE=all \
 |---|---|---|
 | `none` | `series/none.txt` | Minimal SM8x path plus downstream |
 | `sm8x` | `series/sm8x.txt` | Default SM80/SM86-only tuning plus downstream |
+| `sm8x-perf` | `series/sm8x-perf.txt` | `sm8x` plus only experimental MHC prenorm cuBLAS |
 | `verified` | `series/verified.txt` | SM8x and general verified features |
 | `all` | `series/all.txt` | Every compile-checked experiment |
 
@@ -83,6 +88,7 @@ VRAM/performance trade for every deployment.
 | `0001-attention-indexer-gemv.patch` | Attention indexer-weights SM80 GEMV |
 | `0002-marlin-occupancy.patch` | Marlin occupancy/warp perturbations; fork measured regression |
 | `0003-marlin-moe-block-size.patch` | Adaptive Marlin MoE block-size API |
+| `0004-mhc-prenorm-cublas.patch` | Restore the fork's T>=32 BF16 cuBLAS prenorm path; selected only by `sm8x-perf` and `all` |
 
 ### `patches/experimental-general/`
 
@@ -131,10 +137,10 @@ sources. Use a full sm_80 build for a clean image.
 
 Completed:
 
-- all four series apply cleanly from the official pin;
-- all four series pass Python compilation and `git diff --check`;
-- the `all` series matches its submitted Git tree exactly;
-- the `sm8x` series contains only core, SM8x, and downstream paths.
+- all five series apply cleanly from the official pin;
+- all five series pass Python compilation and `git diff --check`;
+- the `sm8x` series contains only core, SM8x, and downstream paths;
+- the `sm8x-perf` series adds only MHC prenorm cuBLAS to `sm8x`.
 
 Still required:
 
