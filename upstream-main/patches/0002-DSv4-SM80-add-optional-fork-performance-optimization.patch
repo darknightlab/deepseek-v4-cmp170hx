@@ -1,9 +1,10 @@
-From 98c41ca37bb84d6e70b5c8dab50fd5084527cfc5 Mon Sep 17 00:00:00 2001
+From f3e33aef8595dd51ecbff0c57a8df9314a49b830 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 10:40:37 +0800
 Subject: [PATCH 2/3] DSv4 SM80: add optional fork performance optimizations
 
 ---
+ csrc/custom_all_reduce.cuh                    |   3 +-
  csrc/libtorch_stable/persistent_topk.cuh      | 836 ++++++++++--------
  .../quantization/marlin/marlin.cu             | 137 ++-
  csrc/libtorch_stable/sampler.cu               | 164 ++--
@@ -23,10 +24,24 @@ Subject: [PATCH 2/3] DSv4 SM80: add optional fork performance optimizations
  vllm/utils/multi_stream_utils.py              |  14 +
  vllm/v1/attention/ops/mqa_logits_triton.py    |  14 +-
  vllm/v1/worker/gpu/spec_decode/speculator.py  |  16 +-
- 19 files changed, 2082 insertions(+), 577 deletions(-)
+ 20 files changed, 2083 insertions(+), 579 deletions(-)
  create mode 100644 vllm/distributed/device_communicators/hier_all_reduce.py
  create mode 100644 vllm/model_executor/kernels/linear/gemv_triton.py
 
+diff --git a/csrc/custom_all_reduce.cuh b/csrc/custom_all_reduce.cuh
+index 385a0e0ae7..739f502e30 100644
+--- a/csrc/custom_all_reduce.cuh
++++ b/csrc/custom_all_reduce.cuh
+@@ -298,8 +298,7 @@ class CustomAllreduce {
+       if (world_size_ == 2) {                           \
+         KL(ngpus, cross_device_reduce_1stage);          \
+       } else if (fully_connected_) {                    \
+-        if ((world_size_ <= 4 && bytes < 512 * 1024) || \
+-            (world_size_ <= 8 && bytes < 256 * 1024)) { \
++        if (bytes < 512 * 1024) {                       \
+           KL(ngpus, cross_device_reduce_1stage);        \
+         } else {                                        \
+           KL(ngpus, cross_device_reduce_2stage);        \
 diff --git a/csrc/libtorch_stable/persistent_topk.cuh b/csrc/libtorch_stable/persistent_topk.cuh
 index 9ae0fd4bcb..8b21165dca 100644
 --- a/csrc/libtorch_stable/persistent_topk.cuh

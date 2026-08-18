@@ -59,7 +59,8 @@ It contains fork code that still has a real caller:
 - Marlin occupancy experiments and optional FP8-to-BF16 dequantization;
 - SM80 router GEMV;
 - deterministic MoE alignment;
-- hierarchical all-reduce and configurable custom-AR capacity;
+- hierarchical all-reduce, configurable custom-AR capacity, and the measured
+  A100 one-shot/two-shot crossover;
 - vocab-parallel local argmax infrastructure used by supported proposers;
 - wide cache gather/dequant and compressor warp tuning;
 - grouped/scaled indexer-logits tuning and paged-Q predecode;
