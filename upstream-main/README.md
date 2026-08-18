@@ -16,7 +16,7 @@ order.
 # Default: SM80/SM86 correctness and hardware-specific tuning + downstream
 ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm8x
 
-# SM8x baseline plus only the c3046d1/12810046 prenorm cuBLAS optimization
+# SM8x baseline plus isolated MHC-prenorm and sparse-prefill experiments
 VLLM_FORK_PERFORMANCE_PROFILE=sm8x-perf \
   ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm8x-perf
 
@@ -37,7 +37,7 @@ VLLM_FORK_PERFORMANCE_PROFILE=all \
 |---|---|---|
 | `none` | `series/none.txt` | Minimal SM8x path plus downstream |
 | `sm8x` | `series/sm8x.txt` | Default SM80/SM86-only tuning plus downstream |
-| `sm8x-perf` | `series/sm8x-perf.txt` | `sm8x` plus only experimental MHC prenorm cuBLAS |
+| `sm8x-perf` | `series/sm8x-perf.txt` | `sm8x` plus only MHC prenorm cuBLAS and sparse-prefill BLOCK_K=32 |
 | `verified` | `series/verified.txt` | SM8x and general verified features |
 | `all` | `series/all.txt` | Every compile-checked experiment |
 
@@ -89,6 +89,7 @@ VRAM/performance trade for every deployment.
 | `0002-marlin-occupancy.patch` | Marlin occupancy/warp perturbations; fork measured regression |
 | `0003-marlin-moe-block-size.patch` | Adaptive Marlin MoE block-size API |
 | `0004-mhc-prenorm-cublas.patch` | Restore the fork's T>=32 BF16 cuBLAS prenorm path; selected only by `sm8x-perf` and `all` |
+| `0005-sparse-prefill-block-k.patch` | Use BLOCK_K=32 for wide sparse prefill on SM80-class shared memory; selected only by `sm8x-perf` and `all` |
 
 ### `patches/experimental-general/`
 
@@ -116,8 +117,9 @@ Ten effective fork optimizations are not yet exported:
 - MHC: fused post/sqrsum, prenorm row sharding, fixed split selection, and
   int8 all-reduce ownership (4);
 - sparse MLA: LUT decode, 8192-row ragged scan, ratio-128 query blocking,
-  uniform decode grouping, decode split tuning, and exact-tile specialization
-  (6).
+  uniform decode grouping, decode split tuning, and exact-mask specialization
+  (6; the independently ported wide prefill KV tile is no longer part of this
+  remaining group).
 
 Two measured-regression knobs (`decode maxnreg`, query-blocked decode) are
 recorded separately and are not counted among those ten.
@@ -140,7 +142,8 @@ Completed:
 - all five series apply cleanly from the official pin;
 - all five series pass Python compilation and `git diff --check`;
 - the `sm8x` series contains only core, SM8x, and downstream paths;
-- the `sm8x-perf` series adds only MHC prenorm cuBLAS to `sm8x`.
+- the `sm8x-perf` series adds only MHC prenorm cuBLAS and sparse-prefill
+  BLOCK_K=32 to `sm8x`.
 
 Still required:
 

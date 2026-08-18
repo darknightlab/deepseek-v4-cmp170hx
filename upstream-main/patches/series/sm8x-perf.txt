@@ -6,4 +6,5 @@ sm8x/0004-custom-ar-crossover.patch
 sm8x/0005-sparse-kv-gather.patch
 sm8x/0006-compressor-warps.patch
 experimental-sm8x/0004-mhc-prenorm-cublas.patch
+experimental-sm8x/0005-sparse-prefill-block-k.patch
 downstream/0001-170hx-serving.patch

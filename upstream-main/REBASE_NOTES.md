@@ -51,10 +51,14 @@ and unrelated experimental features. The 170HX compose must still set
 not force its memory/performance trade globally.
 
 `VLLM_FORK_PERFORMANCE_PROFILE=sm8x-perf` applies that same eight-patch
-baseline plus only
-`patches/experimental-sm8x/0004-mhc-prenorm-cublas.patch`. It restores the
-fork's default T>=32 BF16 cuBLAS prenorm route without enabling any other
-general or experimental optimization.
+baseline plus only:
+
+- `patches/experimental-sm8x/0004-mhc-prenorm-cublas.patch`;
+- `patches/experimental-sm8x/0005-sparse-prefill-block-k.patch`.
+
+It restores the fork's default T>=32 BF16 cuBLAS prenorm route and the
+SM80 wide sparse-prefill KV tile without enabling input fusion, fast scan,
+ratio-128 query blocking, or any other general/experimental optimization.
 
 ## Verified feature patches
 
@@ -77,8 +81,10 @@ control.
   model-runner consumers.
 - `experimental-sm8x/0003-marlin-moe-block-size.patch`: adaptive block-size API.
 - `experimental-sm8x/0004-mhc-prenorm-cublas.patch`: restores the fork's
-  default T>=32 BF16 cuBLAS prenorm path; selected by `sm8x-perf` for isolated
-  prefill A/B.
+  default T>=32 BF16 cuBLAS prenorm path.
+- `experimental-sm8x/0005-sparse-prefill-block-k.patch`: selects BLOCK_K=32
+  for wide sparse prefill when shared-memory capacity permits. Both patches
+  are selected by `sm8x-perf` for isolated prefill A/B.
 - `experimental-general/0003-marlin-moe-workspace.patch`: persistent workspace
   wired into current call sites.
 - `experimental-general/0004-attention-input-fusion.patch`: input fusion only.
@@ -131,7 +137,7 @@ metadata. They must be ported as independent features:
 3. ratio-128 query-blocked prefill;
 4. uniform decode grouping;
 5. decode split tuning;
-6. exact-tile specialization.
+6. exact-mask specialization (wide KV tiling is already exported separately).
 
 The decode-maxnreg and query-blocked-decode knobs are preserved in the fork
 record as measured regressions and are not counted among these ten effective
@@ -160,7 +166,7 @@ No non-applying or compile-broken source diff is stored as a usable patch.
 
 ```text
 minimal + downstream profile:       git am + compileall PASS
-sm8x + MHC prenorm profile:          git am + compileall PASS
+sm8x isolated prefill profile:      git am + compileall PASS
 verified + downstream profile:      git am + compileall PASS
 all currently exported patches:     git am + compileall PASS
 ```
