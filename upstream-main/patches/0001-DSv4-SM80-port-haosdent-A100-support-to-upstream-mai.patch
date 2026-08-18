@@ -1,4 +1,4 @@
-From 049a5b786ccd40b6b7060eab83bfba39e81e9b6c Mon Sep 17 00:00:00 2001
+From 748fd9c6a276c4b1012f97933521a30e51b6d880 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 02:31:36 +0800
 Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
@@ -66,10 +66,9 @@ Subject: [PATCH 1/2] DSv4 SM80: port haosdent A100 support to upstream main
  vllm/v1/structured_output/__init__.py         | 158 +++-
  vllm/v1/structured_output/backend_xgrammar.py |  11 +-
  vllm/v1/worker/gpu/buffer_utils.py            |  72 ++
- vllm/v1/worker/gpu/cudagraph_utils.py         |  41 +
  .../gpu/spec_decode/dspark/markov_argmax.py   | 451 ++++++++++
  vllm/v1/worker/gpu/spec_decode/speculator.py  |  16 +-
- 65 files changed, 6398 insertions(+), 720 deletions(-)
+ 64 files changed, 6357 insertions(+), 720 deletions(-)
  create mode 100644 tests/kernels/attention/test_dsv4_fp8_sm80.py
  create mode 100644 tests/kernels/attention/test_mqa_logits_triton.py
  create mode 100644 tests/kernels/attention/test_triton_mla_sparse_kernel.py
@@ -8205,65 +8204,6 @@ index f8336fa074..eb2fb1295c 100644
  class UvaBuffer:
      def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
          if not is_uva_available():
-diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index 8e24a0ee02..8b5948898d 100644
---- a/vllm/v1/worker/gpu/cudagraph_utils.py
-+++ b/vllm/v1/worker/gpu/cudagraph_utils.py
-@@ -402,6 +402,21 @@ class CudaGraphManager:
-                     max_query_len,
-                 ):
-                     return desc
-+
-+        # Nothing in this token count's candidate list fits. The staging table
-+        # built above gives each token count exactly one bucket -- the smallest
-+        # captured size >= it -- so when that bucket happens to be a decode-only
-+        # one (its key is round_up(capture_size, decode_query_len), which lands
-+        # between two mixed capture sizes), a mixed step in that range sees only
-+        # uniform-decode descriptors and falls all the way to eager. Pad up to
-+        # the smallest mixed graph that can absorb the batch instead; the runner
-+        # already pads its inputs to desc.num_tokens for every step
-+        # (model_runner.prepare_inputs).
-+        padded = self._pad_up_candidate(
-+            num_reqs, num_tokens, uniform_token_count, effective_loras
-+        )
-+        if padded is not None:
-+            return padded
-         return BatchExecutionDescriptor(
-             cg_mode=CUDAGraphMode.NONE,
-             num_tokens=num_tokens,
-@@ -409,6 +424,32 @@ class CudaGraphManager:
-             num_active_loras=effective_loras,
-         )
- 
-+    def _pad_up_candidate(
-+        self,
-+        num_reqs: int,
-+        num_tokens: int,
-+        uniform_token_count: int | None,
-+        num_active_loras: int,
-+    ) -> BatchExecutionDescriptor | None:
-+        """Smallest captured PIECEWISE graph that can absorb `num_tokens`.
-+
-+        FULL graphs are deliberately excluded: they carry request padding and a
-+        uniform-token-count contract that padding up would also have to satisfy.
-+        """
-+        if not self._graphs_captured or num_tokens <= 0:
-+            return None
-+        best: BatchExecutionDescriptor | None = None
-+        # _capture_descs is sorted by num_tokens descending, so the last
-+        # compatible descriptor at or above num_tokens is the smallest one.
-+        for desc in self._capture_descs.get(CUDAGraphMode.PIECEWISE, ()):
-+            if desc.num_tokens < num_tokens:
-+                break
-+            if _is_compatible(
-+                desc, num_reqs, num_tokens, uniform_token_count, num_active_loras
-+            ):
-+                best = desc
-+        return best
-+
-     def run_fullgraph(self, desc: BatchExecutionDescriptor):
-         """Replay a captured FULL cudagraph."""
-         assert desc.cg_mode == CUDAGraphMode.FULL, (
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/markov_argmax.py b/vllm/v1/worker/gpu/spec_decode/dspark/markov_argmax.py
 new file mode 100644
 index 0000000000..00370120fe

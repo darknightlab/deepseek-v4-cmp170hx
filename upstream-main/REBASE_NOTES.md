@@ -81,7 +81,10 @@ KV layout changes (#51704), and structured-output fixes (#52436). Choosing the
 old fork side wholesale for these conflicts would discard those changes. The
 fork's paired per-group block-zeroing scheduler protocol is also omitted, so
 `KVCacheManager`, scheduler output, and the newer official `KVBlockZeroer`
-retain one internally consistent upstream contract.
+retain one internally consistent upstream contract. The fork's cudagraph
+pad-up fallback is omitted as well; its `_is_compatible()` call predates the
+pinned base's required `max_query_len` argument and crashed long-context
+serving after startup.
 
 Fork-only conflict hunks not ported are optional or superseded paths, including
 adaptive Marlin workspace/block sizing, MHC fused-sqrsum and int8 all-reduce
