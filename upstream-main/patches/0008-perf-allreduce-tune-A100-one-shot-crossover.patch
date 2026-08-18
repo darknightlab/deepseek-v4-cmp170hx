@@ -1,7 +1,7 @@
-From 7468fb62c333724b0369b23fb49693b6d6693c68 Mon Sep 17 00:00:00 2001
+From bc6fed8dc3f69736277feb8880185743ef000854 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:53:40 +0800
-Subject: [PATCH 06/26] perf(allreduce): tune A100 one-shot crossover
+Subject: [PATCH 08/26] perf(allreduce): tune A100 one-shot crossover
 
 ---
  csrc/custom_all_reduce.cuh | 3 +--

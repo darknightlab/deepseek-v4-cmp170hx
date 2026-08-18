@@ -1,4 +1,4 @@
-From 1c65feb4823b8f2ee6ec54b1bc7f76b0025ce171 Mon Sep 17 00:00:00 2001
+From 04c264e66baed3002406f1bb0cfeced3c58e271b Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:32:33 +0800
 Subject: [PATCH 26/26] experiment(indexer): shard prefill and decode query

@@ -1,7 +1,7 @@
-From 77131071aa771eb3f4e5d410fed897b79a05b7d1 Mon Sep 17 00:00:00 2001
+From 042cc1942ffbf4397c099bcfa5579d0abaf01917 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:12:04 +0800
-Subject: [PATCH 11/26] perf(cache): widen sparse KV gather and dequantization
+Subject: [PATCH 13/26] perf(cache): widen sparse KV gather and dequantization
 
 ---
  .../deepseek_v4/common/ops/cache_utils.py     | 72 ++++++++++---------

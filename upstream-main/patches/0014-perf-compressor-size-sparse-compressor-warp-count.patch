@@ -1,7 +1,7 @@
-From 7c80c1858f7664eeb3611e795d25710e1ee5be7b Mon Sep 17 00:00:00 2001
+From d109b3e76eb5d5bfb22a8b2b691164cf43e337ee Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:12:14 +0800
-Subject: [PATCH 12/26] perf(compressor): size sparse compressor warp count
+Subject: [PATCH 14/26] perf(compressor): size sparse compressor warp count
 
 ---
  .../deepseek_v4/common/ops/fused_compress_quant_cache.py  | 8 +++++++-

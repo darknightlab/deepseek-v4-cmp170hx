@@ -1,7 +1,7 @@
-From 80686289cc8029cfa3aa15e9074e1d7d1bb4f0c4 Mon Sep 17 00:00:00 2001
+From e076974f04fab12247b057e78bb10e382f049647 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:09:55 +0800
-Subject: [PATCH 03/26] perf(marlin): optionally dequantize FP8 weights for
+Subject: [PATCH 04/26] perf(marlin): optionally dequantize FP8 weights for
  cuBLAS
 
 ---
@@ -10,7 +10,7 @@ Subject: [PATCH 03/26] perf(marlin): optionally dequantize FP8 weights for
  2 files changed, 72 insertions(+)
 
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 15705b7c17..6f88782671 100755
+index 9ca1eb782e..acfd41d588 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
 @@ -183,6 +183,8 @@ if TYPE_CHECKING:
@@ -22,7 +22,7 @@ index 15705b7c17..6f88782671 100755
      VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
      VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
      VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
-@@ -1504,6 +1506,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1508,6 +1510,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
          os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
      ),

@@ -53,8 +53,13 @@ add_patch() {
 add_patch 0001
 case "$VLLM_FORK_PERFORMANCE_PROFILE" in
     none) ;;
+    sm8x)
+        for n in 2 4 5 6 8 13 14; do
+            add_patch "$(printf '%04d' "$n")"
+        done
+        ;;
     verified)
-        for n in $(seq 2 14); do
+        for n in 2 3 4 5 7 8 9 10 11 12 13 14 15; do
             add_patch "$(printf '%04d' "$n")"
         done
         ;;
@@ -64,7 +69,7 @@ case "$VLLM_FORK_PERFORMANCE_PROFILE" in
         done
         ;;
     *)
-        echo "ERROR: VLLM_FORK_PERFORMANCE_PROFILE must be none, verified, or all." >&2
+        echo "ERROR: VLLM_FORK_PERFORMANCE_PROFILE must be none, sm8x, verified, or all." >&2
         exit 1
         ;;
 esac

@@ -1,4 +1,4 @@
-From 54ae0a658b1ff8612cb0a56ff17c0c07ea94a865 Mon Sep 17 00:00:00 2001
+From cb157740bb444794a4837cc9e76f980b21a14dab Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:26:22 +0800
 Subject: [PATCH 24/26] experiment(dspark): shard Markov logits for local

@@ -1,7 +1,7 @@
-From 1e8a1baed400527e038851e97406673abf548aeb Mon Sep 17 00:00:00 2001
+From c9d53b3cf9fc42c75acf439278d5b285d8833c6a Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Date: Tue, 18 Aug 2026 11:12:51 +0800
-Subject: [PATCH 13/26] perf(indexer): tune SM80 MQA logits kernels
+Date: Tue, 18 Aug 2026 12:26:23 +0800
+Subject: [PATCH 02/26] perf(indexer): tune SM80 MQA logits kernels
 
 ---
  vllm/envs.py                               | 16 ++++++++++++++++
@@ -9,10 +9,10 @@ Subject: [PATCH 13/26] perf(indexer): tune SM80 MQA logits kernels
  2 files changed, 27 insertions(+), 3 deletions(-)
 
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 2de79579e5..853202a9bb 100755
+index 15705b7c17..9ca1eb782e 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -197,6 +197,10 @@ if TYPE_CHECKING:
+@@ -195,6 +195,10 @@ if TYPE_CHECKING:
      VLLM_MOE_USE_DEEP_GEMM: bool = True
      VLLM_USE_DEEP_GEMM_E8M0: bool = True
      VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
@@ -20,10 +20,10 @@ index 2de79579e5..853202a9bb 100755
 +    VLLM_INDEXER_LOGITS_MAXNREG: int = 0
 +    VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
 +    VLLM_INDEXER_PAGED_Q_BF16: bool = True
-     VLLM_LOCAL_ARGMAX_ALLREDUCE: bool = False
      VLLM_DCP_Q_REPLICATE: bool = False
      VLLM_USE_DIRECT_DCP_A2A: bool | None = None
-@@ -1569,6 +1573,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
+@@ -1557,6 +1561,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
          int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
      ),
@@ -39,9 +39,9 @@ index 2de79579e5..853202a9bb 100755
 +    "VLLM_INDEXER_PAGED_Q_BF16": lambda: (
 +        os.environ.get("VLLM_INDEXER_PAGED_Q_BF16", "1") == "1"
 +    ),
-     "VLLM_LOCAL_ARGMAX_ALLREDUCE": lambda: (
-         os.environ.get("VLLM_LOCAL_ARGMAX_ALLREDUCE", "0") == "1"
-     ),
+     # Opt-in MLA DCP query replication: skip the decode query all-gather.
+     "VLLM_DCP_Q_REPLICATE": lambda: bool(int(os.getenv("VLLM_DCP_Q_REPLICATE", "0"))),
+     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
 diff --git a/vllm/v1/attention/ops/mqa_logits_triton.py b/vllm/v1/attention/ops/mqa_logits_triton.py
 index 1221e1601e..737870f7e2 100644
 --- a/vllm/v1/attention/ops/mqa_logits_triton.py

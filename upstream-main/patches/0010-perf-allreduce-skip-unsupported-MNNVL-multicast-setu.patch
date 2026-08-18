@@ -1,7 +1,7 @@
-From 4795bc202c73072754dc928086e7931d5440fcf1 Mon Sep 17 00:00:00 2001
+From 2b836259d699184c55381e56b6c32b4f868fbe27 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:54:34 +0800
-Subject: [PATCH 08/26] perf(allreduce): skip unsupported MNNVL multicast setup
+Subject: [PATCH 10/26] perf(allreduce): skip unsupported MNNVL multicast setup
 
 ---
  .../distributed/device_communicators/custom_all_reduce.py | 8 ++++++++

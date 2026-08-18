@@ -1,7 +1,7 @@
-From b12d857761be3f2c2f855c5da460637b3149084d Mon Sep 17 00:00:00 2001
+From 82589eaa5439b7b9c18ee5f46f70d7f0fcb61bf1 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:18:33 +0800
-Subject: [PATCH 19/26] perf(marlin-moe): reuse persistent expert workspace
+Subject: [PATCH 20/26] perf(marlin-moe): reuse persistent expert workspace
 
 ---
  .../layers/fused_moe/experts/marlin_moe.py    | 28 +++++++++++++++++++

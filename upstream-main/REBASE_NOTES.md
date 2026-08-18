@@ -40,26 +40,36 @@ by the default profile.
 Its MQA controls are conservative: KV group 1, no register cap, in-kernel Q
 decode, and no k-scale factoring. It does not modify `vllm/envs.py`.
 
+## SM8x deployment profile
+
+`VLLM_FORK_PERFORMANCE_PROFILE=sm8x` applies only the minimal correctness
+patch, SM80/SM86-specific tuning (`0002`, `0004`-`0006`, `0008`, `0013`,
+`0014`), and downstream `0023`. It excludes architecture-neutral and unrelated
+experimental features. The 170HX compose must still set
+`VLLM_MARLIN_FP8_DEQUANT_BF16=1`; applying `0004` provides the path but does
+not force its memory/performance trade globally.
+
 ## Verified feature patches
 
-Patches `0002` through `0014` are independently scoped and compile together or
-without one another according to their dependencies. They cover top-k,
-Marlin-dequant, router GEMV, deterministic MoE alignment, all-reduce, local
-argmax, cache gather, compressor warps, indexer logits, and multi-stream
-control.
+The default verified profile explicitly applies `0002`-`0005` and
+`0007`-`0015`; `0006` is SM8x-specific but remains current-port experimental.
+The patches cover indexer logits, top-k, Marlin-dequant, router GEMV,
+deterministic MoE alignment, all-reduce, local argmax, cache gather, compressor
+warps, and multi-stream control.
 
 ## Experimental feature patches
 
-- `0015`: the fork's Marlin occupancy/warp perturbations. The measurement record
+- `0006`: Attention indexer-weights SM80 GEMV; included by `sm8x`, excluded
+  from the default verified profile until current-port hardware A/B.
+- `0016`: the fork's Marlin occupancy/warp perturbations. The measurement record
   says these regress; flags remain off.
-- `0016`: cudagraph pad-up ported to the current six-argument
+- `0017`: cudagraph pad-up ported to the current six-argument
   `_is_compatible(..., max_query_len)` API. The obsolete five-argument version
   caused a production EngineCore failure and is not exported.
-- `0017`: pinned staging pool plus all three model-runner consumers.
-- `0018`: adaptive Marlin MoE block-size API.
-- `0019`: persistent Marlin MoE workspace wired into all current call sites.
-- `0020`: Attention input projection fusion only.
-- `0021`: Attention indexer-weights SM80 GEMV only.
+- `0018`: pinned staging pool plus all three model-runner consumers.
+- `0019`: adaptive Marlin MoE block-size API.
+- `0020`: persistent Marlin MoE workspace wired into all current call sites.
+- `0021`: Attention input projection fusion only.
 - `0022`: replicated Attention GEMM token sharding only.
 - `0024`: DSpark vocab-sharded Markov selection while retaining official
   confidence/adaptive-verification behavior.

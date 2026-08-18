@@ -1,7 +1,7 @@
-From 40a7bf48f2942b3b4b81f8c5265a0b8563a0c59d Mon Sep 17 00:00:00 2001
+From 9365fe0d8d3107407e54df144e0e414f17876a01 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:13:38 +0800
-Subject: [PATCH 15/26] experiment(marlin): expose occupancy and warp
+Subject: [PATCH 16/26] experiment(marlin): expose occupancy and warp
  perturbations
 
 ---

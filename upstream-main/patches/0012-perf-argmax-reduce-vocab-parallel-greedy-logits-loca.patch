@@ -1,7 +1,7 @@
-From a95ad94c70fb0b072add0eee3749c3ef40f1af1e Mon Sep 17 00:00:00 2001
+From ff2216732a89644c0b83d46212069bcb6ab065df Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:11:55 +0800
-Subject: [PATCH 10/26] perf(argmax): reduce vocab-parallel greedy logits
+Subject: [PATCH 12/26] perf(argmax): reduce vocab-parallel greedy logits
  locally
 
 ---
@@ -11,20 +11,20 @@ Subject: [PATCH 10/26] perf(argmax): reduce vocab-parallel greedy logits
  3 files changed, 125 insertions(+), 26 deletions(-)
 
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 402b4d6144..2de79579e5 100755
+index bbae1aff59..853202a9bb 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -197,6 +197,7 @@ if TYPE_CHECKING:
-     VLLM_MOE_USE_DEEP_GEMM: bool = True
-     VLLM_USE_DEEP_GEMM_E8M0: bool = True
-     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+@@ -201,6 +201,7 @@ if TYPE_CHECKING:
+     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
+     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
+     VLLM_INDEXER_PAGED_Q_BF16: bool = True
 +    VLLM_LOCAL_ARGMAX_ALLREDUCE: bool = False
      VLLM_DCP_Q_REPLICATE: bool = False
      VLLM_USE_DIRECT_DCP_A2A: bool | None = None
      VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
-@@ -1568,6 +1569,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
-     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
-         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+@@ -1584,6 +1585,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_INDEXER_PAGED_Q_BF16": lambda: (
+         os.environ.get("VLLM_INDEXER_PAGED_Q_BF16", "1") == "1"
      ),
 +    "VLLM_LOCAL_ARGMAX_ALLREDUCE": lambda: (
 +        os.environ.get("VLLM_LOCAL_ARGMAX_ALLREDUCE", "0") == "1"

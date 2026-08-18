@@ -18,39 +18,50 @@ by the default profile.
 VLLM_FORK_PERFORMANCE_PROFILE=none \
   ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm80-minimal
 
-# Default: independently scoped, reachable optimizations 0002-0014
+# SM80/SM86-specific execution and tuning only, plus downstream
+VLLM_FORK_PERFORMANCE_PROFILE=sm8x \
+  ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm8x
+
+# Default: explicitly selected reachable optimizations
 ./scripts/prepare-upstream-vllm.sh /opt/vllm-upstream
 
-# Include compile-checked experimental ports 0015-0022 and 0024-0026
+# Include every compile-checked experimental port
 VLLM_FORK_PERFORMANCE_PROFILE=all \
   ./scripts/prepare-upstream-vllm.sh /opt/vllm-upstream-all
 ```
+
+| Profile | Applied patches | Purpose |
+|---|---|---|
+| `none` | `0001`, `0023` | Minimal SM8x execution plus downstream |
+| `sm8x` | `0001`, `0002`, `0004`-`0006`, `0008`, `0013`, `0014`, `0023` | SM80/SM86-specific path and tuning |
+| `verified` | `0001`, `0002`-`0005`, `0007`-`0015`, `0023` | Default verified feature set |
+| `all` | `0001`-`0026` | All exported experiments |
 
 ## Patch index
 
 | Patch | Feature | Default |
 |---|---|---|
 | 0001 | Minimal Ampere correctness: backend, software FP8, Triton sparse MLA/MQA, fallbacks | always |
-| 0002 | Deterministic persistent top-k and sampler | verified |
-| 0003 | Optional Marlin FP8-to-BF16 dequantization | verified |
-| 0004 | SM80 router BF16 Triton GEMV | verified |
-| 0005 | Deterministic MoE alignment | verified, runtime flag off |
-| 0006 | A100 custom-AR one-shot/two-shot crossover | verified |
-| 0007 | Configurable custom-AR registered-buffer capacity | verified |
-| 0008 | Skip unsupported MNNVL multicast setup | verified |
-| 0009 | Island-aware hierarchical all-reduce | verified |
-| 0010 | Vocab-parallel local argmax infrastructure | verified |
-| 0011 | Wide sparse KV gather/dequantization | verified |
-| 0012 | Sparse compressor warp sizing | verified |
-| 0013 | SM80 MQA/indexer logits tuning | verified |
-| 0014 | Multi-stream capture safety and control | verified |
-| 0015 | Marlin occupancy/warp perturbations | experiment, flags off |
-| 0016 | Cudagraph PIECEWISE pad-up with current `max_query_len` API | experiment |
-| 0017 | Pinned input metadata staging pools | experiment |
-| 0018 | Adaptive Marlin MoE block-size selector | experiment |
-| 0019 | Persistent Marlin MoE workspace | experiment |
-| 0020 | Fuse replicated Attention input projections | experiment |
-| 0021 | Attention indexer-weights SM80 GEMV | experiment |
+| 0002 | SM80 MQA/indexer logits tuning | verified |
+| 0003 | Deterministic persistent top-k and sampler | verified |
+| 0004 | Optional Marlin FP8-to-BF16 dequantization | verified |
+| 0005 | SM80 router BF16 Triton GEMV | verified |
+| 0006 | Attention indexer-weights SM80 GEMV | experiment; included by `sm8x` |
+| 0007 | Deterministic MoE alignment | verified, runtime flag off |
+| 0008 | A100 custom-AR one-shot/two-shot crossover | verified |
+| 0009 | Configurable custom-AR registered-buffer capacity | verified |
+| 0010 | Skip unsupported MNNVL multicast setup | verified |
+| 0011 | Island-aware hierarchical all-reduce | verified |
+| 0012 | Vocab-parallel local argmax infrastructure | verified |
+| 0013 | Wide sparse KV gather/dequantization | verified |
+| 0014 | Sparse compressor warp sizing | verified |
+| 0015 | Multi-stream capture safety and control | verified |
+| 0016 | Marlin occupancy/warp perturbations | experiment, flags off |
+| 0017 | Cudagraph PIECEWISE pad-up with current `max_query_len` API | experiment |
+| 0018 | Pinned input metadata staging pools | experiment |
+| 0019 | Adaptive Marlin MoE block-size selector | experiment |
+| 0020 | Persistent Marlin MoE workspace | experiment |
+| 0021 | Fuse replicated Attention input projections | experiment |
 | 0022 | TP-shard replicated Attention GEMMs | experiment |
 | 0023 | 170HX downstream: DSpark+PP, long context, parsers, structured output, disk KV | always |
 | 0024 | DSpark vocab-sharded Markov local argmax | experiment |

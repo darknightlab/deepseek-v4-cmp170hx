@@ -1,14 +1,14 @@
-From 2321799ebc89c715a8b60a6d6451200602b19daa Mon Sep 17 00:00:00 2001
+From e10b0392fac5d154ce5e325b89be1b9951ddaf84 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Date: Tue, 18 Aug 2026 11:57:13 +0800
-Subject: [PATCH 21/26] perf(attention): use SM80 GEMV for indexer weights
+Date: Tue, 18 Aug 2026 12:26:56 +0800
+Subject: [PATCH 06/26] perf(attention): use SM80 GEMV for indexer weights
 
 ---
  vllm/models/deepseek_v4/attention.py | 7 +++++++
  1 file changed, 7 insertions(+)
 
 diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
-index a6cde2dd45..2525896e4c 100644
+index 7245b614da..76fb3bdf3d 100644
 --- a/vllm/models/deepseek_v4/attention.py
 +++ b/vllm/models/deepseek_v4/attention.py
 @@ -15,6 +15,10 @@ from transformers import DeepseekV2Config, DeepseekV3Config
@@ -22,7 +22,7 @@ index a6cde2dd45..2525896e4c 100644
  from vllm.model_executor.layers.linear import (
      ColumnParallelLinear,
      MergedColumnParallelLinear,
-@@ -601,6 +605,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+@@ -548,6 +552,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
              indexer = self.indexer
  
              def indexer_weights_proj() -> torch.Tensor:

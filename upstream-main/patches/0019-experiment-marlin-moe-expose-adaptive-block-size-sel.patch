@@ -1,7 +1,7 @@
-From 01298f17a7ce005f61331d585ec674725944e4d4 Mon Sep 17 00:00:00 2001
+From 856a9646d377498bc6ca2a06167289efecda6aec Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:17:14 +0800
-Subject: [PATCH 18/26] experiment(marlin-moe): expose adaptive block-size
+Subject: [PATCH 19/26] experiment(marlin-moe): expose adaptive block-size
  selection
 
 ---

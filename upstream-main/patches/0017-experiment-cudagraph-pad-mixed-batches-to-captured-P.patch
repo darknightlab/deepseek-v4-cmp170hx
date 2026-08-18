@@ -1,7 +1,7 @@
-From 8f5a3a51bbd1af3e36cc78458be40bfd3b99c382 Mon Sep 17 00:00:00 2001
+From ed9aea5c8299ef8ffdd4b907dd11281194dacacf Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:15:27 +0800
-Subject: [PATCH 16/26] experiment(cudagraph): pad mixed batches to captured
+Subject: [PATCH 17/26] experiment(cudagraph): pad mixed batches to captured
  PIECEWISE graphs
 
 ---
