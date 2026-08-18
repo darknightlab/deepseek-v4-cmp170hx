@@ -16,6 +16,7 @@ ceiling lives. Run it against a normally-configured server, not a benchmark one.
 | `bench_decode3.py` | end-to-end decode over 3 content types | The headline number. Speculative decoding's benefit is content-dependent, so one prompt is not a measurement. |
 | `bench_concurrency.py` | aggregate decode and prefill vs concurrent requests | Threads, unique prompt per request. |
 | `bench_prefill.py` | prefill vs prompt length | `max_tokens=1`, rate against the server's own `usage.prompt_tokens`. |
+| `prefill_speedtest.mjs` | OpenAI-streaming TTFT prefill at 512 → 16,384 tokens | Node 18+, no packages. Mirrors `llm_speedtest`: warmup calibration, unique prompts, `/v1/models` latency probes, API usage tokens, first reasoning/content token boundary, retries, and optional JSON output. |
 | `bench_longctx.py` | prefill at 4k → 100k+ | Shows PP's prefill climbing with context and TP's staying flat. |
 | `bench_decode_stream.py` | decode vs context, by streaming | Timestamps first and last token — no subtraction. Requests `include_usage` and `ignore_eos`; see pitfalls below. |
 | `bench_needle.py` | **correctness** at long context | Buries a passphrase at 10% depth and asks for it back. Tests that the sparse indexer really selects the right blocks — not merely that the run completes. |
@@ -27,6 +28,20 @@ ceiling lives. Run it against a normally-configured server, not a benchmark one.
 | `analyze_accum.py` | turns a `bench_chat_accumulate` JSONL into the three answers | Speed shape (TTFT / decode / cache split by depth), coherence (repetition metrics by depth), correctness (canary recall by depth and by how far back the fact was). |
 | `bench_chunk_truth.py` | ★ **whether your token rate is real** | In a *single* request, counts SSE chunks **and** tokenizes the generated text, then compares both to `usage.completion_tokens`. Run this once against any new streaming harness before trusting it — it is how the 3.3–4.6× chunk-counting error was proven rather than argued. |
 | `analyze_content_vs_degen.py` | whether degeneration tracks content or depth | Pools every turn across runs, groups repetition metrics by content type **and** by depth band, and reports the depth-matched comparison. Written to test a hypothesis that it then **falsified** — kept as the template for checking a co-occurrence against its base rate. |
+
+Run the Node streaming prefill sweep with:
+
+```bash
+OPENAI_API_KEY=... node bench/prefill_speedtest.mjs \
+  --url http://192.168.2.16:8000/v1/chat/completions \
+  --model deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --json /tmp/prefill.json
+```
+
+It always tests `512, 1024, 2048, 4096, 8192, 16384`. The warmup request
+calibrates the chat-template token offset so the API-reported prompt count lands
+on those requested lengths. The first non-empty reasoning or content delta is
+the TTFT boundary. Use `--help` for concurrency and sampling controls.
 
 ## Pitfalls these encode
 
