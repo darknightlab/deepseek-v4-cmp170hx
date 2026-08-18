@@ -1,7 +1,7 @@
-From 32bab956e9ec717b35fa0a9a5f8153e62a2783cf Mon Sep 17 00:00:00 2001
+From 1c65feb4823b8f2ee6ec54b1bc7f76b0025ce171 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:32:33 +0800
-Subject: [PATCH 21/21] experiment(indexer): shard prefill and decode query
+Subject: [PATCH 26/26] experiment(indexer): shard prefill and decode query
  rows across TP
 
 ---
@@ -215,10 +215,10 @@ index bd9d409a53..7bfc551350 100644
              # if padded, we need to unpack
              # the topk indices removing padded tokens
 diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
-index f118d91b5e..1678f59a69 100644
+index 1b41f7ded0..b625a99a54 100644
 --- a/vllm/models/deepseek_v4/attention.py
 +++ b/vllm/models/deepseek_v4/attention.py
-@@ -1061,6 +1061,8 @@ class DeepseekV4Indexer(nn.Module):
+@@ -982,6 +982,8 @@ class DeepseekV4Indexer(nn.Module):
              use_fp4_cache=self.use_fp4_kv,
          )
  
@@ -227,7 +227,7 @@ index f118d91b5e..1678f59a69 100644
          # None on ROCm — maybe_execute_in_parallel falls back to sequential.
          self.aux_stream = aux_stream
          self.ln_events: list[torch.cuda.Event] = [
-@@ -1068,6 +1070,91 @@ class DeepseekV4Indexer(nn.Module):
+@@ -989,6 +991,91 @@ class DeepseekV4Indexer(nn.Module):
              torch.cuda.Event(),
          ]
  
@@ -319,7 +319,7 @@ index f118d91b5e..1678f59a69 100644
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -1105,7 +1192,13 @@ class DeepseekV4Indexer(nn.Module):
+@@ -1026,7 +1113,13 @@ class DeepseekV4Indexer(nn.Module):
                      )
                  return None, None, None
  

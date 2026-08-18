@@ -1,7 +1,7 @@
 From 25d9da9215e591b598684c2556c051f5fed25440 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:10:35 +0800
-Subject: [PATCH 05/21] perf(moe): add deterministic expert alignment
+Subject: [PATCH 05/26] perf(moe): add deterministic expert alignment
 
 ---
  vllm/envs.py                                  |   4 +

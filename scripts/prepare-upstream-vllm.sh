@@ -54,12 +54,12 @@ add_patch 0001
 case "$VLLM_FORK_PERFORMANCE_PROFILE" in
     none) ;;
     verified)
-        for n in $(seq 2 11); do
+        for n in $(seq 2 14); do
             add_patch "$(printf '%04d' "$n")"
         done
         ;;
     all)
-        for n in $(seq 2 17); do
+        for n in $(seq 2 22); do
             add_patch "$(printf '%04d' "$n")"
         done
         ;;
@@ -68,9 +68,9 @@ case "$VLLM_FORK_PERFORMANCE_PROFILE" in
         exit 1
         ;;
 esac
-add_patch 0018
+add_patch 0023
 if [[ "$VLLM_FORK_PERFORMANCE_PROFILE" == "all" ]]; then
-    for n in $(seq 19 21); do
+    for n in $(seq 24 26); do
         add_patch "$(printf '%04d' "$n")"
     done
 fi

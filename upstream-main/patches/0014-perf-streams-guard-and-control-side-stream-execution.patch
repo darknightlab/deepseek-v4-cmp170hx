@@ -1,7 +1,7 @@
-From c4cc6714b2db6a277755df51bd5c25b398bfb7cb Mon Sep 17 00:00:00 2001
+From 050c7ec4b741ef4dae223ac9d150c9c0e3bb37db Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:13:26 +0800
-Subject: [PATCH 11/21] perf(streams): guard and control side-stream execution
+Subject: [PATCH 14/26] perf(streams): guard and control side-stream execution
 
 ---
  vllm/envs.py                     |  4 ++++

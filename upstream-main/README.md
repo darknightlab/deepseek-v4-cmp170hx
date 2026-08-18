@@ -8,7 +8,7 @@ vllm-project/vllm 402547d7f02bdbfc5dce5d27dc21f50dd4d627b6
 
 The queue is ordered, feature-scoped, and reproducible. Patch `0001` is the
 minimal SM80 execution path. Each subsequent optimization has its own patch;
-`0018` is the project downstream layer. Experimental patches are never enabled
+`0023` is the project downstream layer. Experimental patches are never enabled
 by the default profile.
 
 ## Profiles
@@ -18,10 +18,10 @@ by the default profile.
 VLLM_FORK_PERFORMANCE_PROFILE=none \
   ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm80-minimal
 
-# Default: independently scoped, reachable optimizations 0002-0011
+# Default: independently scoped, reachable optimizations 0002-0014
 ./scripts/prepare-upstream-vllm.sh /opt/vllm-upstream
 
-# Include compile-checked experimental ports 0012-0017 and 0019-0021
+# Include compile-checked experimental ports 0015-0022 and 0024-0026
 VLLM_FORK_PERFORMANCE_PROFILE=all \
   ./scripts/prepare-upstream-vllm.sh /opt/vllm-upstream-all
 ```
@@ -35,22 +35,27 @@ VLLM_FORK_PERFORMANCE_PROFILE=all \
 | 0003 | Optional Marlin FP8-to-BF16 dequantization | verified |
 | 0004 | SM80 router BF16 Triton GEMV | verified |
 | 0005 | Deterministic MoE alignment | verified, runtime flag off |
-| 0006 | A100 custom-AR crossover and hierarchical all-reduce | verified |
-| 0007 | Vocab-parallel local argmax infrastructure | verified |
-| 0008 | Wide sparse KV gather/dequantization | verified |
-| 0009 | Sparse compressor warp sizing | verified |
-| 0010 | SM80 MQA/indexer logits tuning | verified |
-| 0011 | Multi-stream capture safety and control | verified |
-| 0012 | Marlin occupancy/warp perturbations | experiment, flags off |
-| 0013 | Cudagraph PIECEWISE pad-up with current `max_query_len` API | experiment |
-| 0014 | Pinned input metadata staging pools | experiment |
-| 0015 | Adaptive Marlin MoE block-size selector | experiment |
-| 0016 | Persistent Marlin MoE workspace | experiment |
-| 0017 | Attention input-GEMM fusion and replicated-GEMM token sharding | experiment |
-| 0018 | 170HX downstream: DSpark+PP, long context, parsers, structured output, disk KV | always |
-| 0019 | DSpark vocab-sharded Markov local argmax | experiment |
-| 0020 | DSpark fused sequential Markov argmax | experiment |
-| 0021 | Indexer prefill/decode query-row sharding | experiment |
+| 0006 | A100 custom-AR one-shot/two-shot crossover | verified |
+| 0007 | Configurable custom-AR registered-buffer capacity | verified |
+| 0008 | Skip unsupported MNNVL multicast setup | verified |
+| 0009 | Island-aware hierarchical all-reduce | verified |
+| 0010 | Vocab-parallel local argmax infrastructure | verified |
+| 0011 | Wide sparse KV gather/dequantization | verified |
+| 0012 | Sparse compressor warp sizing | verified |
+| 0013 | SM80 MQA/indexer logits tuning | verified |
+| 0014 | Multi-stream capture safety and control | verified |
+| 0015 | Marlin occupancy/warp perturbations | experiment, flags off |
+| 0016 | Cudagraph PIECEWISE pad-up with current `max_query_len` API | experiment |
+| 0017 | Pinned input metadata staging pools | experiment |
+| 0018 | Adaptive Marlin MoE block-size selector | experiment |
+| 0019 | Persistent Marlin MoE workspace | experiment |
+| 0020 | Fuse replicated Attention input projections | experiment |
+| 0021 | Attention indexer-weights SM80 GEMV | experiment |
+| 0022 | TP-shard replicated Attention GEMMs | experiment |
+| 0023 | 170HX downstream: DSpark+PP, long context, parsers, structured output, disk KV | always |
+| 0024 | DSpark vocab-sharded Markov local argmax | experiment |
+| 0025 | DSpark fused sequential Markov argmax | experiment |
+| 0026 | Indexer prefill/decode query-row sharding | experiment |
 
 The patch boundaries are functional boundaries, not one-file boundaries. A
 feature patch includes all of its required caller, metadata, kernel, config,
@@ -58,12 +63,18 @@ and test changes.
 
 ## Deliberately not exported yet
 
-Two original fork groups still require a semantic port before they can be
-represented as usable official-main patches:
+Ten meaningful fork optimizations still require a semantic port before they
+can be represented as usable official-main patches:
 
-- MHC int8 all-reduce / fused sqrsum / prenorm sharding;
-- the deep sparse-MLA campaign (8192-row ragged scan, ratio-128 query blocking,
-  uniform decode grouping/split tuning, and exact-tile specialization).
+- MHC: fused post/sqrsum, prenorm row sharding, fixed split selection, and
+  int8 all-reduce ownership (4);
+- sparse MLA: LUT decode, 8192-row ragged scan, ratio-128 query blocking,
+  uniform decode grouping, decode split tuning, and exact-tile specialization
+  (6).
+
+Two additional sparse knobs (`decode maxnreg` and query-blocked decode) are
+recorded fork experiments that measured slower; they are not counted among the
+ten remaining effective optimizations.
 
 Their fork versions overwrite newer official metadata/kernel APIs. Keeping a
 raw diff that does not apply or compile would recreate the half-connected-code

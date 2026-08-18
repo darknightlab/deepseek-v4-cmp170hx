@@ -1,7 +1,7 @@
-From 625785daad7631eec037c7aa8e57cbe92df7a4ee Mon Sep 17 00:00:00 2001
+From 779c548950ddaa8462a5a318d270eaee5fb98fbe Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:28:46 +0800
-Subject: [PATCH 20/21] experiment(dspark): fuse sequential Markov argmax
+Subject: [PATCH 25/26] experiment(dspark): fuse sequential Markov argmax
  kernels
 
 ---

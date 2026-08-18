@@ -1,0 +1,23 @@
+From 7468fb62c333724b0369b23fb49693b6d6693c68 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 11:53:40 +0800
+Subject: [PATCH 06/26] perf(allreduce): tune A100 one-shot crossover
+
+---
+ csrc/custom_all_reduce.cuh | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/csrc/custom_all_reduce.cuh b/csrc/custom_all_reduce.cuh
+index 385a0e0ae7..739f502e30 100644
+--- a/csrc/custom_all_reduce.cuh
++++ b/csrc/custom_all_reduce.cuh
+@@ -298,8 +298,7 @@ class CustomAllreduce {
+       if (world_size_ == 2) {                           \
+         KL(ngpus, cross_device_reduce_1stage);          \
+       } else if (fully_connected_) {                    \
+-        if ((world_size_ <= 4 && bytes < 512 * 1024) || \
+-            (world_size_ <= 8 && bytes < 256 * 1024)) { \
++        if (bytes < 512 * 1024) {                       \
+           KL(ngpus, cross_device_reduce_1stage);        \
+         } else {                                        \
+           KL(ngpus, cross_device_reduce_2stage);        \

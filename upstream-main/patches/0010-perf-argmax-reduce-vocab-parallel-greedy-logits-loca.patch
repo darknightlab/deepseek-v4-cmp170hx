@@ -1,7 +1,7 @@
-From 3cb0c89d8b1570ac30abcd26e6a14e7b37a444e9 Mon Sep 17 00:00:00 2001
+From a95ad94c70fb0b072add0eee3749c3ef40f1af1e Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:11:55 +0800
-Subject: [PATCH 07/21] perf(argmax): reduce vocab-parallel greedy logits
+Subject: [PATCH 10/26] perf(argmax): reduce vocab-parallel greedy logits
  locally
 
 ---

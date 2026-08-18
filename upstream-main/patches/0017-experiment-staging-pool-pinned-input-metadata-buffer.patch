@@ -1,7 +1,7 @@
-From 60bdd4c81195917cd5c608beb1fb960211473b5f Mon Sep 17 00:00:00 2001
+From 4ae788188eec29a74c81be8500c0fdfb628463a8 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:16:35 +0800
-Subject: [PATCH 14/21] experiment(staging): pool pinned input metadata buffers
+Subject: [PATCH 17/26] experiment(staging): pool pinned input metadata buffers
 
 ---
  vllm/v1/worker/gpu/buffer_utils.py | 72 ++++++++++++++++++++++++++++++

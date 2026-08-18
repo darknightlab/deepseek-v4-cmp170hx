@@ -1,0 +1,87 @@
+From 0b4b5b45570b8319ceb77a6786182d121ab24a1c Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 11:56:50 +0800
+Subject: [PATCH 20/26] perf(attention): fuse replicated input projections
+
+---
+ vllm/models/deepseek_v4/attention.py | 53 ++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
+index 7245b614da..a6cde2dd45 100644
+--- a/vllm/models/deepseek_v4/attention.py
++++ b/vllm/models/deepseek_v4/attention.py
+@@ -48,6 +48,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.models.utils import extract_layer_index
+ from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
+ from vllm.models.deepseek_v4.compressor import DeepseekCompressor
++from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.multi_stream_utils import (
+     execute_in_parallel,
+@@ -358,6 +359,36 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+                 eager_scratch_pool=eager_scratch_pool,
+             )
+ 
++        self.fused_input_weight: torch.Tensor | None = None
++        self.fused_input_splits: list[int] = []
++
++    def process_weights_after_loading(self, dtype: torch.dtype) -> None:
++        self.fuse_input_gemm_weights()
++
++    def fuse_input_gemm_weights(self) -> None:
++        if self.compressor is None or self.indexer is None:
++            return
++        if not current_platform.is_cuda():
++            return
++        parts = [
++            self.compressor.fused_wkv_wgate.weight,
++            self.indexer.compressor.fused_wkv_wgate.weight,
++            self.indexer.weights_proj.weight,
++        ]
++        if any(
++            w is None or w.dtype != torch.bfloat16 or w.shape[1] != self.hidden_size
++            for w in parts
++        ):
++            return
++        merged = torch.cat([w.detach() for w in parts], dim=0).contiguous()
++        splits = [w.shape[0] for w in parts]
++        offset = 0
++        for w, n in zip(parts, splits):
++            w.data = merged[offset : offset + n]
++            offset += n
++        self.fused_input_weight = merged
++        self.fused_input_splits = splits
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -531,6 +562,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         # On ROCm, aux_streams is None and execute_in_parallel runs serially.
+         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
+ 
++        if self.fused_input_weight is not None:
++            merged_w = self.fused_input_weight
++            splits = self.fused_input_splits
++
++            def merged_input_gemm() -> torch.Tensor:
++                return torch.mm(hidden_states, merged_w.T, out_dtype=torch.float32)
++
++            aux_fns[0] = merged_input_gemm
++            qr_kv, (merged_out, _, _) = execute_in_parallel(
++                lambda: self._fused_wqa_wkv_gemm(hidden_states),
++                aux_fns,
++                self.ln_events[0],
++                self.ln_events[1:4],
++                aux_streams,
++                enable=hidden_states.shape[0]
++                <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
++            )
++            kv_score, indexer_kv_score, indexer_weights = merged_out.split(
++                splits, dim=-1
++            )
++            return qr_kv, kv_score, indexer_kv_score, indexer_weights
++
+         if self.compressor is not None:
+             # Local ref so the closure keeps a non-None type for mypy.
+             compressor = self.compressor

@@ -1,7 +1,7 @@
 From 8fd48b7f827b5c4e55c6d9d559983e83c39fc7ad Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:09:22 +0800
-Subject: [PATCH 02/21] perf(topk): make top-k and sampling deterministic
+Subject: [PATCH 02/26] perf(topk): make top-k and sampling deterministic
 
 ---
  csrc/libtorch_stable/persistent_topk.cuh     | 836 +++++++++++--------

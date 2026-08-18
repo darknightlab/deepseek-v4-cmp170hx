@@ -1,0 +1,185 @@
+From 75c9da0bbcc61d7388ac5718d12098a4e23a396f Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 11:58:31 +0800
+Subject: [PATCH 22/26] perf(attention): shard replicated GEMMs across TP
+
+---
+ vllm/distributed/utils.py            | 25 ++++++++++++++++
+ vllm/envs.py                         |  8 +++++
+ vllm/models/deepseek_v4/attention.py | 44 +++++++++++++++++++++++++---
+ 3 files changed, 73 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/distributed/utils.py b/vllm/distributed/utils.py
+index eec9890f02..7808ec1d0a 100644
+--- a/vllm/distributed/utils.py
++++ b/vllm/distributed/utils.py
+@@ -124,6 +124,31 @@ def split_tensor_along_last_dim(
+     return tensor_list
+ 
+ 
++def balanced_row_counts(num_rows: int, size: int) -> list[int]:
++    """Per-rank row counts, ``base + (r < rem)``.
++
++    Remainder rows go one each to the lowest-numbered ranks, so the union over
++    ranks is exact with no gap, overlap, or padding row at any row count.
++    Per-rank counts may differ by one, which is why consumers gather with
++    ``all_gatherv(sizes=...)`` rather than ``all_gather``.
++
++    Every row-sharding feature (indexer query shard, unreplicated attention
++    GEMMs, mHC prenorm shard) must derive from this one rule; two features
++    splitting the same rows with different remainder policies would gather
++    matching sizes with scrambled content.
++    """
++    base, rem = divmod(num_rows, size)
++    return [base + (r < rem) for r in range(size)]
++
++
++def balanced_row_bounds(start: int, stop: int, rank: int, size: int) -> tuple[int, int]:
++    """This rank's contiguous half-open ``balanced_row_counts`` range within
++    ``[start, stop)``, in closed form."""
++    base, rem = divmod(stop - start, size)
++    lo = start + rank * base + min(rank, rem)
++    return lo, lo + base + (rank < rem)
++
++
+ def get_pp_indices(
+     num_hidden_layers: int, pp_rank: int, pp_size: int
+ ) -> tuple[int, int]:
+diff --git a/vllm/envs.py b/vllm/envs.py
+index a78e6ce9c0..e55540c418 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -197,6 +197,8 @@ if TYPE_CHECKING:
+     VLLM_MOE_USE_DEEP_GEMM: bool = True
+     VLLM_USE_DEEP_GEMM_E8M0: bool = True
+     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
++    VLLM_UNREPLICATE_ATTN_GEMMS: bool = True
++    VLLM_UNREPLICATE_ATTN_GEMMS_ALL_LAYERS: bool = True
+     VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
+     VLLM_INDEXER_LOGITS_MAXNREG: int = 0
+     VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
+@@ -1574,6 +1576,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
+         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+     ),
++    "VLLM_UNREPLICATE_ATTN_GEMMS": lambda: (
++        os.environ.get("VLLM_UNREPLICATE_ATTN_GEMMS", "1") == "1"
++    ),
++    "VLLM_UNREPLICATE_ATTN_GEMMS_ALL_LAYERS": lambda: (
++        os.environ.get("VLLM_UNREPLICATE_ATTN_GEMMS_ALL_LAYERS", "1") == "1"
++    ),
+     "VLLM_INDEXER_LOGITS_FACTOR_K_SCALE": lambda: (
+         os.environ.get("VLLM_INDEXER_LOGITS_FACTOR_K_SCALE", "1") == "1"
+     ),
+diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
+index 2525896e4c..1b41f7ded0 100644
+--- a/vllm/models/deepseek_v4/attention.py
++++ b/vllm/models/deepseek_v4/attention.py
+@@ -43,7 +43,12 @@ from vllm.config import (
+     VllmConfig,
+     get_current_vllm_config,
+ )
+-from vllm.distributed import get_tensor_model_parallel_world_size
++from vllm.distributed import (
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++    get_tp_group,
++)
++from vllm.distributed.utils import balanced_row_bounds, balanced_row_counts
+ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+@@ -72,6 +77,7 @@ from vllm.v1.kv_cache_interface import (
+ )
+ 
+ logger = init_logger(__name__)
++_UNREPLICATE_MIN_TOKENS = 1024
+ 
+ 
+ @triton.jit
+@@ -200,6 +206,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         layer_id = extract_layer_index(prefix)
+ 
+         self.prefix = prefix  # Alias for compatibility with compressor
++        self._unreplicate_gemms = envs.VLLM_UNREPLICATE_ATTN_GEMMS and tp_size > 1
++        self._unreplicate_all_layers = envs.VLLM_UNREPLICATE_ATTN_GEMMS_ALL_LAYERS
+         self.hidden_size = config.hidden_size
+         self.n_heads = config.num_attention_heads
+         assert self.n_heads % tp_size == 0
+@@ -540,6 +548,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+             o_padded,
+         )
+ 
++    @staticmethod
++    def _shard_tokens(x: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
++        tp = get_tensor_model_parallel_world_size()
++        rows = balanced_row_counts(x.shape[0], tp)
++        lo, hi = balanced_row_bounds(
++            0, x.shape[0], get_tensor_model_parallel_rank(), tp
++        )
++        return x[lo:hi], rows
++
++    @staticmethod
++    def _gather_tokens(y: torch.Tensor, rows: list[int]) -> torch.Tensor:
++        return get_tp_group().all_gatherv(y, dim=0, sizes=rows)
++
++    def _unreplicate_tokens(self, n_tokens: int) -> bool:
++        return self._unreplicate_gemms and n_tokens >= _UNREPLICATE_MIN_TOKENS
++
+     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Override point: the ROCm layer preshuffles this weight in place, so
+         # it cannot go through fused_wqa_wkv directly.
+@@ -566,16 +590,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         # On ROCm, aux_streams is None and execute_in_parallel runs serially.
+         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
+ 
++        sharded = self._unreplicate_tokens(hidden_states.shape[0]) and (
++            self.fused_input_weight is not None or self._unreplicate_all_layers
++        )
++        gemm_in, rows = (
++            self._shard_tokens(hidden_states) if sharded else (hidden_states, [])
++        )
++
+         if self.fused_input_weight is not None:
+             merged_w = self.fused_input_weight
+             splits = self.fused_input_splits
+ 
+             def merged_input_gemm() -> torch.Tensor:
+-                return torch.mm(hidden_states, merged_w.T, out_dtype=torch.float32)
++                return torch.mm(gemm_in, merged_w.T, out_dtype=torch.float32)
+ 
+             aux_fns[0] = merged_input_gemm
+             qr_kv, (merged_out, _, _) = execute_in_parallel(
+-                lambda: self._fused_wqa_wkv_gemm(hidden_states),
++                lambda: self._fused_wqa_wkv_gemm(gemm_in),
+                 aux_fns,
+                 self.ln_events[0],
+                 self.ln_events[1:4],
+@@ -583,6 +614,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+                 enable=hidden_states.shape[0]
+                 <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+             )
++            if sharded:
++                qr_kv = self._gather_tokens(qr_kv, rows)
++                merged_out = self._gather_tokens(merged_out, rows)
+             kv_score, indexer_kv_score, indexer_weights = merged_out.split(
+                 splits, dim=-1
+             )
+@@ -623,7 +657,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+             aux_fns[2] = indexer_compressor_kv_score
+ 
+         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
+-            lambda: self._fused_wqa_wkv_gemm(hidden_states),
++            lambda: self._fused_wqa_wkv_gemm(gemm_in),
+             aux_fns,
+             self.ln_events[0],
+             self.ln_events[1:4],
+@@ -631,6 +665,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+             enable=hidden_states.shape[0]
+             <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+         )
++        if sharded:
++            qr_kv = self._gather_tokens(qr_kv, rows)
+ 
+         return qr_kv, kv_score, indexer_kv_score, indexer_weights
+ 

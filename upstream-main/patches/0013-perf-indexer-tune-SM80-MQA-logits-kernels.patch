@@ -1,7 +1,7 @@
-From 7b0ad47cd0e98ae985c5955deaf6fbae89fa4001 Mon Sep 17 00:00:00 2001
+From 1e8a1baed400527e038851e97406673abf548aeb Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 11:12:51 +0800
-Subject: [PATCH 10/21] perf(indexer): tune SM80 MQA logits kernels
+Subject: [PATCH 13/26] perf(indexer): tune SM80 MQA logits kernels
 
 ---
  vllm/envs.py                               | 16 ++++++++++++++++

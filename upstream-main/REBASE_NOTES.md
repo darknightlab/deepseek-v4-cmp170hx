@@ -42,7 +42,7 @@ decode, and no k-scale factoring. It does not modify `vllm/envs.py`.
 
 ## Verified feature patches
 
-Patches `0002` through `0011` are independently scoped and compile together or
+Patches `0002` through `0014` are independently scoped and compile together or
 without one another according to their dependencies. They cover top-k,
 Marlin-dequant, router GEMV, deterministic MoE alignment, all-reduce, local
 argmax, cache gather, compressor warps, indexer logits, and multi-stream
@@ -50,27 +50,27 @@ control.
 
 ## Experimental feature patches
 
-- `0012`: the fork's Marlin occupancy/warp perturbations. The measurement record
+- `0015`: the fork's Marlin occupancy/warp perturbations. The measurement record
   says these regress; flags remain off.
-- `0013`: cudagraph pad-up ported to the current six-argument
+- `0016`: cudagraph pad-up ported to the current six-argument
   `_is_compatible(..., max_query_len)` API. The obsolete five-argument version
   caused a production EngineCore failure and is not exported.
-- `0014`: pinned staging pool plus all three model-runner consumers.
-- `0015`: adaptive Marlin MoE block-size API.
-- `0016`: persistent Marlin MoE workspace wired into all current call sites.
-- `0017`: attention input projection fusion, attention GEMV, and token sharding
-  on the current official attention class; MHC and indexer sharding are not
-  mixed into it.
-- `0019`: DSpark vocab-sharded Markov selection while retaining official
+- `0017`: pinned staging pool plus all three model-runner consumers.
+- `0018`: adaptive Marlin MoE block-size API.
+- `0019`: persistent Marlin MoE workspace wired into all current call sites.
+- `0020`: Attention input projection fusion only.
+- `0021`: Attention indexer-weights SM80 GEMV only.
+- `0022`: replicated Attention GEMM token sharding only.
+- `0024`: DSpark vocab-sharded Markov selection while retaining official
   confidence/adaptive-verification behavior.
-- `0020`: fused Markov kernels; automatically declines when adaptive verification
+- `0025`: fused Markov kernels; automatically declines when adaptive verification
   is enabled or fusion operands are unsupported.
-- `0021`: rank-uniform indexer prefill/decode query sharding with caller,
+- `0026`: rank-uniform indexer prefill/decode query sharding with caller,
   metadata, and attention Q-path wiring in one patch.
 
 ## Downstream patch
 
-`0018` contains project behavior rather than generic fork optimization:
+`0023` contains project behavior rather than generic fork optimization:
 
 - DSpark placement and draft propagation over PP;
 - long-context top-k fallback and row chunking;
@@ -84,6 +84,9 @@ failure and is not exported.
 
 ## Remaining semantic ports
 
+Ten effective fork optimizations remain unmerged: four MHC features and six
+Sparse-MLA features.
+
 ### MHC group
 
 The fork MHC changes span CUDA custom all-reduce, stable-ABI declarations,
@@ -93,20 +96,27 @@ measured regressions. The raw fork hunk cannot be an independent patch on the
 pin. It must be split into at least:
 
 1. fused post/sqrsum;
-2. prenorm row sharding/fixed splits;
-3. int8 all-reduce and its complete ownership contract.
+2. prenorm row sharding;
+3. fixed split selection;
+4. int8 all-reduce and its complete ownership contract.
 
 ### Sparse-MLA group
 
 The remaining campaign changes alter both ROCm/Ampere kernels and their graph
 metadata. They must be ported as independent features:
 
-1. 8192-row ragged prefix scan;
-2. ratio-128 query-blocked prefill;
-3. uniform decode grouping and split tuning;
-4. exact-tile specialization.
+1. LUT-based FP8 decode;
+2. 8192-row ragged prefix scan;
+3. ratio-128 query-blocked prefill;
+4. uniform decode grouping;
+5. decode split tuning;
+6. exact-tile specialization.
 
-The existing `0008`, `0010`, and `0021` already carry the independently
+The decode-maxnreg and query-blocked-decode knobs are preserved in the fork
+record as measured regressions and are not counted among these ten effective
+optimizations.
+
+The existing `0011`, `0013`, and `0026` already carry the independently
 portable cache, indexer-logits, and query-sharding parts.
 
 No non-applying or compile-broken source diff is stored as a usable patch.

@@ -1,7 +1,7 @@
-From dff4fb0a6ff19b380c939e7f03f939e72571a07b Mon Sep 17 00:00:00 2001
+From 4a6094921e011ea47eaa77699b26b4bdf829381e Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 10:41:12 +0800
-Subject: [PATCH 18/21] Apply deepseek-v4-cmp170hx downstream serving fixes
+Subject: [PATCH 23/26] Apply deepseek-v4-cmp170hx downstream serving fixes
 
 ---
  .../responses/test_function_call_parsing.py   |  26 +++
