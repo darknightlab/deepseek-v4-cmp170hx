@@ -1,0 +1,35 @@
+From c6bc483279cd3d419dda4a33d3b95eee08507eb5 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 11:12:14 +0800
+Subject: [PATCH 09/21] perf(compressor): size sparse compressor warp count
+
+---
+ .../deepseek_v4/common/ops/fused_compress_quant_cache.py  | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+index 7cf214a5db..26e348c13f 100644
+--- a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
++++ b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+@@ -36,6 +36,12 @@ else:
+ from .fused_indexer_q import _fp32x2_to_fp4x2
+ 
+ 
++def _sparse_attn_num_warps(compress_ratio: int, overlap: bool) -> int:
++    """Size the head-512 compressor launch for its reduction row count."""
++    rows = (2 if overlap else 1) * compress_ratio
++    return max(4, min(16, rows // 2))
++
++
+ def compress_norm_rope_store_triton(
+     state_cache: torch.Tensor,
+     num_actual: int,
+@@ -67,7 +73,7 @@ def compress_norm_rope_store_triton(
+     """
+     if head_dim == 512:
+         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
+-        num_warps = 4
++        num_warps = _sparse_attn_num_warps(compress_ratio, overlap)
+         kernel_kwargs = {"SANITIZE_CACHE_NANS": _ON_GFX950}
+     elif use_fp4_cache:
+         kernel = _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn

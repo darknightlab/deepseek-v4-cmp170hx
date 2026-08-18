@@ -1,0 +1,155 @@
+From 60bdd4c81195917cd5c608beb1fb960211473b5f Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 11:16:35 +0800
+Subject: [PATCH 14/21] experiment(staging): pool pinned input metadata buffers
+
+---
+ vllm/v1/worker/gpu/buffer_utils.py | 72 ++++++++++++++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py | 23 ++++++++--
+ 2 files changed, 91 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/buffer_utils.py b/vllm/v1/worker/gpu/buffer_utils.py
+index f8336fa074..eb2fb1295c 100644
+--- a/vllm/v1/worker/gpu/buffer_utils.py
++++ b/vllm/v1/worker/gpu/buffer_utils.py
+@@ -41,6 +41,78 @@ def async_copy_to_gpu(
+     return out.copy_(pinned, non_blocking=True)
+ 
+ 
++class PinnedStagingPool:
++    """Round-robin pinned staging buffers for repeated host-to-device copies.
++
++    `x.pin_memory()` on a fresh host array allocates from torch's caching host
++    allocator, which serves a request only from a cached block of sufficient
++    size; a request larger than anything cached calls `cudaHostAlloc`, and
++    page-locking is slow enough (tens of ms observed under load) to stall a
++    step. Staging through buffers owned here means the allocator sees no
++    per-step requests at all.
++
++    Capacity grows to powers of two so a pool allocates O(log n) times over its
++    lifetime and stops entirely once it has seen its largest batch; `reserve()`
++    moves that growth to startup.
++
++    One pool per call site. Buffers are recycled every `max_concurrency` calls,
++    so the reuse distance is that many steps only if the site is reached once
++    per step, which is the same contract `UvaBufferPool` relies on: the depth
++    must be >= the number of in-flight steps (engine batch_queue_size). Not
++    thread-safe; intended for the worker's main thread.
++    """
++
++    def __init__(
++        self,
++        dtype: torch.dtype,
++        max_concurrency: int | None = None,
++    ):
++        if max_concurrency is None:
++            max_concurrency = _DEFAULT_MAX_CONCURRENCY
++        self.dtype = dtype
++        self.max_concurrency = max_concurrency
++        self._bufs: list[torch.Tensor] = []
++        self._capacity = 0
++        self._curr = 0
++        self.num_allocations = 0
++        # Superseded buffers, kept alive because a copy issued from one may
++        # still be in flight when growth replaces it. Freeing them here would
++        # hand the pages back while the device is reading them. The power-of-two
++        # schedule bounds the whole retained series at ~2x the final capacity.
++        self._retired: list[list[torch.Tensor]] = []
++
++    def reserve(self, numel: int) -> None:
++        """Grow to hold `numel` elements now, so serving does not have to."""
++        if numel > self._capacity:
++            capacity = 1 << max(int(numel) - 1, 0).bit_length()
++            if self._bufs:
++                self._retired.append(self._bufs)
++            self._bufs = [
++                torch.empty(capacity, dtype=self.dtype, device="cpu", pin_memory=True)
++                for _ in range(self.max_concurrency)
++            ]
++            self._capacity = capacity
++            self._curr = 0
++            self.num_allocations += self.max_concurrency
++
++    def stage(self, x: torch.Tensor) -> torch.Tensor:
++        """Copy `x` into the next pinned buffer and return that view."""
++        self.reserve(x.numel())
++        self._curr = (self._curr + 1) % self.max_concurrency
++        staged = self._bufs[self._curr][: x.numel()].view(x.shape)
++        staged.copy_(x)
++        return staged
++
++    def copy_to_gpu(
++        self,
++        x: torch.Tensor | np.ndarray,
++        out: torch.Tensor,
++    ) -> torch.Tensor:
++        if isinstance(x, np.ndarray):
++            x = torch.from_numpy(x)
++        return out.copy_(self.stage(x), non_blocking=True)
++
++
+ class UvaBuffer:
+     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
+         if not is_uva_available():
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index aff0c09cab..4a4194b70b 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -87,7 +87,7 @@ from vllm.v1.worker.gpu.attn_utils import (
+ )
+ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.buffer_utils import (
+-    async_copy_to_gpu,
++    PinnedStagingPool,
+     set_default_max_concurrency,
+ )
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+@@ -204,6 +204,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # steps. Must run before any pooled buffer is constructed
+         set_default_max_concurrency(vllm_config.max_concurrent_batches)
+ 
++        self._idx_mapping_staging = PinnedStagingPool(torch.int32)
++        self._cu_num_logits_staging = PinnedStagingPool(torch.int32)
++        self._query_start_loc_staging = PinnedStagingPool(torch.int32)
++        self._idx_mapping_staging.reserve(self.max_num_reqs)
++        self._cu_num_logits_staging.reserve(self.max_num_reqs + 1)
++        self._query_start_loc_staging.reserve(self.max_num_reqs + 1)
++
+         # PP broadcast/recv helper. Runs the collective on a side stream.
+         self.pp_handler: PPHandler | None = None
+ 
+@@ -1120,7 +1127,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         req_ids = batch_req_state.req_ids
+         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
+         idx_mapping_np = batch_req_state.idx_mapping_np
+-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
++        idx_mapping = self._idx_mapping_staging.copy_to_gpu(
++            idx_mapping_np,
++            out=torch.empty(len(req_ids), dtype=torch.int32, device=self.device),
++        )
+         num_reqs = len(req_ids)
+ 
+         # Get the number of draft tokens for each request.
+@@ -1151,7 +1161,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+             cu_num_logits_np[0] = 0
+             np.cumsum(num_logits, out=cu_num_logits_np[1:])
+-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
++            cu_num_logits = self._cu_num_logits_staging.copy_to_gpu(
++                cu_num_logits_np,
++                out=torch.empty(num_reqs + 1, dtype=torch.int32, device=self.device),
++            )
+ 
+         adaptive_verification = (
+             self.adaptive_verification if num_draft_tokens_per_req is not None else None
+@@ -1179,7 +1192,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
+         query_start_loc_np[num_reqs + 1 :] = num_tokens
+         query_start_loc = self.input_buffers.query_start_loc
+-        async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
++        self._query_start_loc_staging.copy_to_gpu(
++            query_start_loc_np, out=query_start_loc
++        )
+         if adaptive_verification is not None:
+             cu_num_logits, query_start_loc, total_num_draft_tokens = (
+                 adaptive_verification.reallocate_drafts(req_ids, idx_mapping)

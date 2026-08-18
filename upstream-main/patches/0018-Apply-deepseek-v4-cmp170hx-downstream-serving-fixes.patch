@@ -1,7 +1,7 @@
-From a14797f80245e5a4968aa7af676b6025573e50b8 Mon Sep 17 00:00:00 2001
+From dff4fb0a6ff19b380c939e7f03f939e72571a07b Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Tue, 18 Aug 2026 10:41:12 +0800
-Subject: [PATCH 3/3] Apply deepseek-v4-cmp170hx downstream serving fixes
+Subject: [PATCH 18/21] Apply deepseek-v4-cmp170hx downstream serving fixes
 
 ---
  .../responses/test_function_call_parsing.py   |  26 +++
@@ -1302,10 +1302,10 @@ index 258b1dff32..9e3270aa51 100644
          self.matcher.rollback(num_tokens)
          self.num_processed_tokens -= num_tokens
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index aff0c09cab..462396accc 100644
+index 4a4194b70b..5337235131 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -247,7 +247,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -254,7 +254,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
                  # Drafting may require auxiliary hidden states from target model outputs
                  self.use_aux_hidden_state_outputs = True
@@ -1317,7 +1317,7 @@ index aff0c09cab..462396accc 100644
                      raise ValueError(
                          f"{self.speculative_config.method} with pipeline parallel "
                          "is not supported."
-@@ -952,7 +955,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -959,7 +962,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          if self.pp_handler is not None:
              outputs = self.pp_handler.get_prev_sampled_outputs()
              if outputs is not None:
@@ -1332,7 +1332,7 @@ index aff0c09cab..462396accc 100644
  
      def add_requests(self, scheduler_output: SchedulerOutput) -> None:
          for new_req_data in scheduler_output.scheduled_new_reqs:
-@@ -1842,6 +1852,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1857,6 +1867,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      mm_inputs=mm_inputs,
                  )
              self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens

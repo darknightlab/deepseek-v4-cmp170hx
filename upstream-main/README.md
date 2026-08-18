@@ -1,75 +1,76 @@
 # Official upstream patch queue
 
-This directory rebases the CMP 170HX stack onto a pinned official
-`vllm-project/vllm` main commit. It leaves the legacy `c3046d1` workflow
-untouched.
-
-## Pinned base
+Pinned base:
 
 ```text
 vllm-project/vllm 402547d7f02bdbfc5dce5d27dc21f50dd4d627b6
-2026-08-17 [Bugfix][CI] Release the shared ColBERT engine before test_colbert_hf_comparison (#52608)
 ```
 
-The pin makes native builds reproducible. Move it only by deliberately rebasing
-and retesting all three layers.
+The queue is ordered, feature-scoped, and reproducible. Patch `0001` is the
+minimal SM80 execution path. Each subsequent optimization has its own patch;
+`0018` is the project downstream layer. Experimental patches are never enabled
+by the default profile.
 
-## Patch layers
-
-1. `0001-DSv4-SM80-add-minimal-...patch`
-
-   Minimal SM80 correctness support. It contains the Ampere sparse-MLA backend,
-   software FP8 encode/decode, Triton sparse attention and indexer logits,
-   DeepGEMM/CuTeDSL fallbacks, the GDN build guard fix, and focused kernel tests.
-   It does not contain communication, Marlin, parser, DSpark serving, disk KV,
-   or unrelated fork experiments.
-
-2. `0002-DSv4-SM80-add-optional-fork-performance-...patch`
-
-   Optional, reachable fork optimizations: deterministic top-k/sampling,
-   Marlin tuning, router GEMV, hierarchical all-reduce, local argmax, cache
-   kernel tuning, indexer-logits tuning, and multi-stream controls. Removing
-   this patch preserves the SM80 execution path and downstream behavior while
-   providing a correctness/performance control arm.
-
-3. `0003-Apply-deepseek-v4-cmp170hx-downstream-...patch`
-
-   Project serving fixes: DSpark+PP, long-context top-k/row chunking, parser and
-   Responses compatibility, structured output, and bounded O_DIRECT disk KV
-   offload for arbitrary PP payload sizes.
-
-The old single residual included provider code whose callers had been lost
-while resolving conflicts. Unreachable MHC int8, DSpark fused-Markov,
-PinnedStagingPool, query-sharding helpers, and their inert environment variables
-are intentionally absent from all three layers.
-
-## Prepare a checkout
-
-Apply all layers (default):
+## Profiles
 
 ```bash
+# Minimal SM80 + downstream serving, no fork performance work
+VLLM_FORK_PERFORMANCE_PROFILE=none \
+  ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm80-minimal
+
+# Default: independently scoped, reachable optimizations 0002-0011
 ./scripts/prepare-upstream-vllm.sh /opt/vllm-upstream
+
+# Include compile-checked experimental ports 0012-0017 and 0019-0021
+VLLM_FORK_PERFORMANCE_PROFILE=all \
+  ./scripts/prepare-upstream-vllm.sh /opt/vllm-upstream-all
 ```
 
-Skip the optional performance layer:
+## Patch index
 
-```bash
-VLLM_APPLY_FORK_PERFORMANCE=0 \
-  ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm80-control
-```
+| Patch | Feature | Default |
+|---|---|---|
+| 0001 | Minimal Ampere correctness: backend, software FP8, Triton sparse MLA/MQA, fallbacks | always |
+| 0002 | Deterministic persistent top-k and sampler | verified |
+| 0003 | Optional Marlin FP8-to-BF16 dequantization | verified |
+| 0004 | SM80 router BF16 Triton GEMV | verified |
+| 0005 | Deterministic MoE alignment | verified, runtime flag off |
+| 0006 | A100 custom-AR crossover and hierarchical all-reduce | verified |
+| 0007 | Vocab-parallel local argmax infrastructure | verified |
+| 0008 | Wide sparse KV gather/dequantization | verified |
+| 0009 | Sparse compressor warp sizing | verified |
+| 0010 | SM80 MQA/indexer logits tuning | verified |
+| 0011 | Multi-stream capture safety and control | verified |
+| 0012 | Marlin occupancy/warp perturbations | experiment, flags off |
+| 0013 | Cudagraph PIECEWISE pad-up with current `max_query_len` API | experiment |
+| 0014 | Pinned input metadata staging pools | experiment |
+| 0015 | Adaptive Marlin MoE block-size selector | experiment |
+| 0016 | Persistent Marlin MoE workspace | experiment |
+| 0017 | Attention input-GEMM fusion and replicated-GEMM token sharding | experiment |
+| 0018 | 170HX downstream: DSpark+PP, long context, parsers, structured output, disk KV | always |
+| 0019 | DSpark vocab-sharded Markov local argmax | experiment |
+| 0020 | DSpark fused sequential Markov argmax | experiment |
+| 0021 | Indexer prefill/decode query-row sharding | experiment |
 
-Probe a newer official commit without changing the pin:
+The patch boundaries are functional boundaries, not one-file boundaries. A
+feature patch includes all of its required caller, metadata, kernel, config,
+and test changes.
 
-```bash
-VLLM_REF=origin/main ./scripts/prepare-upstream-vllm.sh /opt/vllm-candidate
-```
+## Deliberately not exported yet
 
-A clean apply is only an applicability result. Update `UPSTREAM_VLLM_REF` and
-regenerate the queue before treating a newer base as supported.
+Two original fork groups still require a semantic port before they can be
+represented as usable official-main patches:
+
+- MHC int8 all-reduce / fused sqrsum / prenorm sharding;
+- the deep sparse-MLA campaign (8192-row ragged scan, ratio-128 query blocking,
+  uniform decode grouping/split tuning, and exact-tile specialization).
+
+Their fork versions overwrite newer official metadata/kernel APIs. Keeping a
+raw diff that does not apply or compile would recreate the half-connected-code
+problem this split is meant to solve. They remain tracked in
+`REBASE_NOTES.md` and are not silently folded into another patch.
 
 ## Build
-
-From the prepared checkout:
 
 ```bash
 cp /path/to/deepseek-v4-cmp170hx/docker/Dockerfile.splitbuild .
@@ -77,32 +78,22 @@ cp /path/to/deepseek-v4-cmp170hx/docker/dockerignore.txt .dockerignore
 podman build -f Dockerfile.splitbuild -t darknightlab/vllm-170hx:upstream-main .
 ```
 
-The queue changes native headers and, with the performance layer enabled,
-native CUDA sources. Use a full sm_80 source build; a Python-only bind mount is
-not sufficient for a clean build from the official base.
+Patch `0001` changes a native header. Several verified/experimental patches
+change CUDA sources. Use a full sm_80 build for a clean image.
 
-## Verification status
+## Verification
 
 Completed:
 
-- confirmed the fork is exactly one squash commit ahead of its merge-base;
-- reviewed all 18 conflict files and retained newer official implementations
-  where the fork behavior was optional or superseded;
-- verified the minimal-only, minimal+downstream, and full three-layer queues all
-  apply cleanly from the pinned commit and compile as Python trees;
-- completed a full CUDA 13 / Torch 2.13 sm_80 native build;
-- completed three-rank CMP 170HX PP startup, sparse-MLA warmup, DSpark capture,
-  `/v1/models`, and a real chat completion;
-- initialized three bounded 5 GiB O_DIRECT disk KV files with per-rank aligned
-  physical strides;
-- removed incompatible fork protocols found by native build and hardware
-  execution, including partial per-group KV zeroing and cudagraph pad-up.
+- `none`, `verified`, and `all` profiles apply cleanly from the pin;
+- all three profiles pass Python compilation;
+- the `all` profile matches its submitted Git tree exactly;
+- the pre-split active feature set completed a full sm_80 build and PP3
+  startup, DSpark capture, bounded disk-KV initialization, model listing, and
+  a real chat request.
 
 Still required:
 
-- a clean hardware A/B run with `VLLM_APPLY_FORK_PERFORMANCE=0`;
-- four-rank PP verification;
-- sustained long-context, concurrent, eviction, disk cache-hit recovery, and
-  performance comparison against the legacy `c3046d1` image.
-
-The queue is hardware-startup verified, not yet performance-certified.
+- full native build and hardware A/B for the new per-feature profiles;
+- hardware verification of each experimental patch individually;
+- four-card and sustained long-context testing.

@@ -1,0 +1,173 @@
+From 0ac09ec739291993d97bb392e1a92f37d920d668 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 11:10:06 +0800
+Subject: [PATCH 04/21] perf(router): use SM80 BF16 Triton GEMV
+
+---
+ .../kernels/linear/gemv_triton.py             | 120 ++++++++++++++++++
+ .../layers/fused_moe/router/gate_linear.py    |  18 +++
+ 2 files changed, 138 insertions(+)
+ create mode 100644 vllm/model_executor/kernels/linear/gemv_triton.py
+
+diff --git a/vllm/model_executor/kernels/linear/gemv_triton.py b/vllm/model_executor/kernels/linear/gemv_triton.py
+new file mode 100644
+index 0000000000..7b49db875e
+--- /dev/null
++++ b/vllm/model_executor/kernels/linear/gemv_triton.py
+@@ -0,0 +1,120 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""One-launch bf16 GEMV for narrow-N unquantized projections.
++
++cuBLAS handles skinny GEMMs by splitting K and reducing, which for
++``N = 64`` costs two launches (a ``dot_kernel`` plus a ``reduce_1Block_kernel``)
++where the whole operation moves only a few hundred KB. Assigning one CTA per
++output row removes the split entirely: N supplies the parallelism, each CTA
++owns its output, and nothing needs reducing across CTAs.
++
++This only pays at GEMV-ish shapes -- small M, N large enough to fill the
++device, K large enough that a CTA has work to do. Prefill-sized M belongs on
++cuBLAS, so callers gate on :func:`should_use_triton_gemv`.
++"""
++
++import torch
++
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++
++# Measured boundary, not a guess. Summed over the DSv4 call sites (21 indexer
++# + 43 gate layers per step) on A100:
++#
++#     M     production   triton
++#      1     0.435 ms    0.195 ms
++#      2     0.552       0.350
++#      4     0.573       0.465
++#      6     0.565       0.496      (DSpark: 5 speculative tokens + 1)
++#      8     0.555       0.512
++#     16     0.569       0.817      <- cuBLAS takes over
++#
++# Past ~8 rows the CTA-per-row shape re-reads x for every row it accumulates
++# and a real GEMM stops being latency-bound. M is the whole batch's token
++# count, so this lapses on its own at high concurrency.
++MAX_GEMV_TOKENS = 8
++
++
++@triton.jit
++def _bf16_gemv_kernel(
++    x_ptr,
++    w_ptr,
++    out_ptr,
++    M,
++    K,
++    stride_xm,
++    stride_wn,
++    stride_om,
++    BLOCK_M: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    m_offs = tl.arange(0, BLOCK_M)
++    m_mask = m_offs < M
++    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
++    for k0 in tl.range(0, K, BLOCK_K):
++        k_offs = k0 + tl.arange(0, BLOCK_K)
++        k_mask = k_offs < K
++        # One weight row, reused across every token in the batch.
++        wv = tl.load(w_ptr + pid * stride_wn + k_offs, mask=k_mask, other=0.0).to(
++            tl.float32
++        )
++        xv = tl.load(
++            x_ptr + m_offs[:, None] * stride_xm + k_offs[None, :],
++            mask=m_mask[:, None] & k_mask[None, :],
++            other=0.0,
++        ).to(tl.float32)
++        acc += xv * wv[None, :]
++    out = tl.sum(acc, axis=1)
++    tl.store(
++        out_ptr + m_offs * stride_om + pid,
++        out.to(out_ptr.dtype.element_ty),
++        mask=m_mask,
++    )
++
++
++def should_use_triton_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
++    """Whether :func:`bf16_gemv` applies to this call."""
++    return (
++        current_platform.is_cuda()
++        and x.dtype == torch.bfloat16
++        and weight.dtype == torch.bfloat16
++        and x.ndim == 2
++        and weight.ndim == 2
++        and x.shape[0] <= MAX_GEMV_TOKENS
++        and x.shape[1] == weight.shape[1]
++        and x.is_contiguous()
++        and weight.is_contiguous()
++    )
++
++
++def bf16_gemv(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    out_dtype: torch.dtype | None = None,
++) -> torch.Tensor:
++    """``x @ weight.T`` for small M, in one launch.
++
++    Accumulates in fp32 and stores directly in ``out_dtype``, so an fp32
++    output is genuinely fp32 rather than a bf16 result cast upward.
++    """
++    m, k = x.shape
++    n = weight.shape[0]
++    out = torch.empty(m, n, dtype=out_dtype or x.dtype, device=x.device)
++    _bf16_gemv_kernel[(n,)](
++        x,
++        weight,
++        out,
++        m,
++        k,
++        x.stride(0),
++        weight.stride(0),
++        out.stride(0),
++        BLOCK_M=triton.next_power_of_2(max(m, 1)),
++        # The accumulator is [BLOCK_M, BLOCK_K], so the K tile has to shrink as
++        # M grows. At M=1 a wide tile cuts the loop to two trips and measured
++        # 2.30 us against 3.05 for a 256-wide one.
++        BLOCK_K=2048 if m == 1 else 512,
++        num_warps=8,
++    )
++    return out
+diff --git a/vllm/model_executor/layers/fused_moe/router/gate_linear.py b/vllm/model_executor/layers/fused_moe/router/gate_linear.py
+index ba46c1de65..c514771d44 100644
+--- a/vllm/model_executor/layers/fused_moe/router/gate_linear.py
++++ b/vllm/model_executor/layers/fused_moe/router/gate_linear.py
+@@ -7,6 +7,10 @@ import vllm._custom_ops as ops
+ from vllm.config import get_current_vllm_config_or_none
+ from vllm.logger import init_logger
+ from vllm.model_executor.custom_op import PluggableLayer
++from vllm.model_executor.kernels.linear.gemv_triton import (
++    bf16_gemv,
++    should_use_triton_gemv,
++)
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import direct_register_custom_op
+@@ -223,6 +227,20 @@ class GateLinear(ReplicatedLinear):
+             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+             return output, None
+ 
++        # Tier 5.5: one-launch Triton GEMV for pre-Hopper decode. Every tier
++        # above requires SM90+, so SM80 otherwise lands on tier 6, which is
++        # F.linear in bf16 *plus* a separate cast when out_dtype is fp32 --
++        # two launches, and an fp32 output that has already been rounded
++        # through bf16. Accumulating in fp32 and storing fp32 in one launch
++        # is both faster (7.5 -> 3.1 us at M=1, K=4096, E=256) and closer to
++        # the reference (4.8e-7 vs 7.4e-3 against an fp32 matmul).
++        if (
++            not self.allow_specialized_router_gemm
++            and self.weight.dtype == torch.bfloat16
++            and should_use_triton_gemv(x, self.weight)
++        ):
++            return bf16_gemv(x, self.weight, self.out_dtype), None
++
+         # Tier 6: F.linear (ReplicatedLinear)
+         if self.out_dtype is not None and x.dtype != self.weight.dtype:
+             x = x.to(self.weight.dtype)

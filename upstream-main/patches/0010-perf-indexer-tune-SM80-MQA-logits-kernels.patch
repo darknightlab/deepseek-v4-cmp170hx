@@ -1,0 +1,90 @@
+From 7b0ad47cd0e98ae985c5955deaf6fbae89fa4001 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 11:12:51 +0800
+Subject: [PATCH 10/21] perf(indexer): tune SM80 MQA logits kernels
+
+---
+ vllm/envs.py                               | 16 ++++++++++++++++
+ vllm/v1/attention/ops/mqa_logits_triton.py | 14 +++++++++++---
+ 2 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 2de79579e5..853202a9bb 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -197,6 +197,10 @@ if TYPE_CHECKING:
+     VLLM_MOE_USE_DEEP_GEMM: bool = True
+     VLLM_USE_DEEP_GEMM_E8M0: bool = True
+     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
++    VLLM_INDEXER_LOGITS_FACTOR_K_SCALE: bool = True
++    VLLM_INDEXER_LOGITS_MAXNREG: int = 0
++    VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M: int = 0
++    VLLM_INDEXER_PAGED_Q_BF16: bool = True
+     VLLM_LOCAL_ARGMAX_ALLREDUCE: bool = False
+     VLLM_DCP_Q_REPLICATE: bool = False
+     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
+@@ -1569,6 +1573,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
+         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+     ),
++    "VLLM_INDEXER_LOGITS_FACTOR_K_SCALE": lambda: (
++        os.environ.get("VLLM_INDEXER_LOGITS_FACTOR_K_SCALE", "1") == "1"
++    ),
++    "VLLM_INDEXER_LOGITS_MAXNREG": lambda: int(
++        os.environ.get("VLLM_INDEXER_LOGITS_MAXNREG", "0")
++    ),
++    "VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M": lambda: int(
++        os.environ.get("VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M", "0")
++    ),
++    "VLLM_INDEXER_PAGED_Q_BF16": lambda: (
++        os.environ.get("VLLM_INDEXER_PAGED_Q_BF16", "1") == "1"
++    ),
+     "VLLM_LOCAL_ARGMAX_ALLREDUCE": lambda: (
+         os.environ.get("VLLM_LOCAL_ARGMAX_ALLREDUCE", "0") == "1"
+     ),
+diff --git a/vllm/v1/attention/ops/mqa_logits_triton.py b/vllm/v1/attention/ops/mqa_logits_triton.py
+index 1221e1601e..737870f7e2 100644
+--- a/vllm/v1/attention/ops/mqa_logits_triton.py
++++ b/vllm/v1/attention/ops/mqa_logits_triton.py
+@@ -68,7 +68,7 @@ _PREFILL_AUTOTUNE_CONFIGS = [
+         {"BLOCK_N": 128},
+         num_warps=4,
+         num_stages=ns,
+-        maxnreg=None,
++        maxnreg=envs.VLLM_INDEXER_LOGITS_MAXNREG or None,
+     )
+     for ns in (2, 4)
+ ]
+@@ -276,7 +276,7 @@ def fp8_paged_mqa_logits_triton(
+     )
+     kv_scale = kv_flat[:, k_end:].view(torch.float32)
+     q_byte = q.view(torch.uint8)
+-    q_is_bf16 = False
++    q_is_bf16 = envs.VLLM_INDEXER_PAGED_Q_BF16
+ 
+     if clean_logits:
+         logits = torch.full(
+@@ -483,6 +483,14 @@ def _kv_group_min_ctas(device_index: int) -> int:
+ 
+ 
+ def _select_prefill_kv_group(m: int, n: int, device_index: int = 0) -> int:
++    if not _IS_SM80 or n < _KV_GROUP_MIN_N:
++        return 1
++    min_m = envs.VLLM_INDEXER_LOGITS_KV_GROUP_MIN_M
++    if min_m:
++        return _KV_GROUP if m >= min_m else 1
++    grouped_ctas = m * triton.cdiv(n, _PREFILL_BLOCK_N * _KV_GROUP)
++    if grouped_ctas >= _kv_group_min_ctas(device_index):
++        return _KV_GROUP
+     return 1
+ 
+ 
+@@ -571,7 +579,7 @@ def _fp8_mqa_logits_triton_impl(
+         BLOCK_H=BLOCK_H,
+         BLOCK_D=BLOCK_D,
+         KV_GROUP=kv_group,
+-        FACTOR_K_SCALE=False,
++        FACTOR_K_SCALE=envs.VLLM_INDEXER_LOGITS_FACTOR_K_SCALE,
+     )
+     return logits
+ 

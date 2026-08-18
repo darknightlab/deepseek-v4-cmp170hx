@@ -7,7 +7,7 @@ PATCH_DIR="$PROJECT_ROOT/upstream-main/patches"
 PINNED_REF="$(tr -d '[:space:]' < "$PROJECT_ROOT/upstream-main/UPSTREAM_VLLM_REF")"
 DEST="${1:-$PROJECT_ROOT/.work/vllm-upstream}"
 VLLM_REF="${VLLM_REF:-$PINNED_REF}"
-VLLM_APPLY_FORK_PERFORMANCE="${VLLM_APPLY_FORK_PERFORMANCE:-1}"
+VLLM_FORK_PERFORMANCE_PROFILE="${VLLM_FORK_PERFORMANCE_PROFILE:-verified}"
 
 if [[ ! -d "$DEST/.git" ]]; then
     mkdir -p "$(dirname "$DEST")"
@@ -39,25 +39,41 @@ if [[ "$VLLM_REF" != "$PINNED_REF" ]]; then
     echo "WARNING: patches were rebased and verified against $PINNED_REF, not $VLLM_REF." >&2
 fi
 
-PATCHES=(
-    "$PATCH_DIR"/0001-*.patch
-)
-case "$VLLM_APPLY_FORK_PERFORMANCE" in
-    1) PATCHES+=("$PATCH_DIR"/0002-*.patch) ;;
-    0) ;;
+PATCHES=()
+add_patch() {
+    local prefix="$1"
+    local matches=("$PATCH_DIR"/"$prefix"-*.patch)
+    if [[ ${#matches[@]} -ne 1 || ! -f "${matches[0]}" ]]; then
+        echo "ERROR: expected exactly one $prefix patch in $PATCH_DIR." >&2
+        exit 1
+    fi
+    PATCHES+=("${matches[0]}")
+}
+
+add_patch 0001
+case "$VLLM_FORK_PERFORMANCE_PROFILE" in
+    none) ;;
+    verified)
+        for n in $(seq 2 11); do
+            add_patch "$(printf '%04d' "$n")"
+        done
+        ;;
+    all)
+        for n in $(seq 2 17); do
+            add_patch "$(printf '%04d' "$n")"
+        done
+        ;;
     *)
-        echo "ERROR: VLLM_APPLY_FORK_PERFORMANCE must be 0 or 1." >&2
+        echo "ERROR: VLLM_FORK_PERFORMANCE_PROFILE must be none, verified, or all." >&2
         exit 1
         ;;
 esac
-PATCHES+=("$PATCH_DIR"/0003-*.patch)
-
-for patch in "${PATCHES[@]}"; do
-    if [[ ! -f "$patch" ]]; then
-        echo "ERROR: expected patch not found: $patch" >&2
-        exit 1
-    fi
-done
+add_patch 0018
+if [[ "$VLLM_FORK_PERFORMANCE_PROFILE" == "all" ]]; then
+    for n in $(seq 19 21); do
+        add_patch "$(printf '%04d' "$n")"
+    done
+fi
 
 git -C "$DEST" \
     -c user.name="deepseek-v4-cmp170hx patcher" \
@@ -66,5 +82,5 @@ git -C "$DEST" \
 
 printf 'Prepared vLLM checkout at %s\n' "$DEST"
 printf 'Base: %s\n' "$VLLM_REF"
-printf 'Fork performance patch: %s\n' "$VLLM_APPLY_FORK_PERFORMANCE"
+printf 'Performance profile: %s\n' "$VLLM_FORK_PERFORMANCE_PROFILE"
 printf 'Result: %s\n' "$(git -C "$DEST" rev-parse HEAD)"

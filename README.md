@@ -51,13 +51,13 @@ This repo sits on top of that branch.
 
 ### Official upstream patch queue (experimental)
 
-[`upstream-main/`](upstream-main/README.md) carries a three-layer queue on a pinned
-official `vllm-project/vllm` main commit: minimal SM80 correctness, optional reachable fork
-performance work, and this repository's 170HX serving fixes. This removes the long-term need
-to clone the force-pushed fork and includes newer upstream features such as bounded native
-disk KV offload. The queue has completed a full sm_80 build and three-card PP/DSpark/disk-KV
-startup plus a real chat request, but has not completed the four-card performance suite, so
-`c3046d1` remains the recommended benchmark baseline.
+[`upstream-main/`](upstream-main/README.md) carries a feature-scoped queue on a pinned
+official `vllm-project/vllm` main commit: one minimal SM80 correctness patch, independent
+verified/experimental fork optimization patches, and this repository's 170HX serving patch.
+This removes the long-term need to clone the force-pushed fork and includes newer upstream
+features such as bounded native disk KV offload. The queue has completed a full sm_80 build
+and three-card PP/DSpark/disk-KV startup plus a real chat request, but has not completed the
+four-card performance suite, so `c3046d1` remains the recommended benchmark baseline.
 
 Prepare a candidate checkout with:
 

@@ -1,0 +1,153 @@
+From 6ba1a3b25363f0f9fc46ba3c31dcfb6c2e450bf4 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 11:17:14 +0800
+Subject: [PATCH 15/21] experiment(marlin-moe): expose adaptive block-size
+ selection
+
+---
+ .../layers/fused_moe/experts/marlin_moe.py    | 118 +++++++++++++++++-
+ 1 file changed, 114 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index c3eb5eefb3..ec87f6701e 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -3,7 +3,7 @@
+ """Fused MoE utilities for GPTQ."""
+ 
+ import math
+-from collections.abc import Callable
++from collections.abc import Callable, Sequence
+ 
+ import torch
+ 
+@@ -55,6 +55,106 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+ from vllm.platforms import current_platform
+ from vllm.scalar_type import ScalarType, scalar_types
+ 
++BLOCK_SIZE_M_LADDER = (8, 16, 32, 48, 64)
++
++# The two rungs the refinement below chooses between, smaller first.
++ADAPTIVE_BLOCK_SIZE_M_CANDIDATES = (48, 64)
++
++# Below this many tokens the ladder is used verbatim, so a decode step never
++# reaches the refinement at all. The ladder only gets near its top rung well
++# above this bound, so the threshold costs nothing.
++ADAPTIVE_BLOCK_SIZE_M_MIN_TOKENS = 512
++
++
++def _ladder_block_size_m(m: int, topk: int, num_experts: int) -> int:
++    """The historical block_size_m ladder: first rung the average load fits in.
++
++    Returns the smallest rung where the average expert's load is under 90% of a
++    block, i.e. the smallest rung that gives most experts a single block.
++    `num_experts` is the *local* expert count, as it has always been -- under
++    expert parallelism the caller has already rescaled `m` to this rank's share.
++    """
++    for block_size_m in BLOCK_SIZE_M_LADDER:
++        if m * topk / num_experts / block_size_m < 0.9:
++            break
++    return block_size_m
++
++
++def moe_padded_rows(
++    topk_ids: torch.Tensor,
++    global_num_experts: int,
++    block_sizes: tuple[int, ...],
++) -> torch.Tensor:
++    """MMA rows the expert GEMM runs at each of `block_sizes`.
++
++    `moe_align_block_size` rounds every expert's token count up to a whole
++    block, so the kernel's row count is sum_e ceil(count_e / b) * b -- the same
++    quantity it reports as `num_tokens_post_padded`, but for several candidate
++    block sizes at once and without having to run the alignment for each.
++
++    Unrouted slots are marked -1 in topk_ids and the alignment skips them, so
++    the histogram is taken shifted by one and bucket 0 dropped -- masking them
++    out instead would need a `nonzero`, which is a second device sync.
++    """
++    hist = torch.bincount(topk_ids.flatten() + 1, minlength=global_num_experts + 1)
++    counts = hist[1:]
++    b = torch.tensor(block_sizes, device=counts.device, dtype=counts.dtype)
++    return (((counts[:, None] + b - 1) // b) * b).sum(0)
++
++
++def select_block_size_m(
++    m: int,
++    topk: int,
++    num_experts: int,
++    padded_rows: Sequence[int] | None = None,
++) -> int:
++    """Pick block_size_m for one expert call.
++
++    The ladder sizes a block from the *average* expert load, which is the right
++    call while one block per expert is the goal. At its top rung that stops
++    being true: with 256 experts, topk=6 and 2048 tokens the average expert
++    holds exactly 48 tokens and the ladder still returns 64, so a quarter of
++    every block's MMA rows are padding.
++
++    Whether the 48 rung is actually cheaper depends on the load *distribution*,
++    not the average: a smaller block packs rows better but re-reads the expert's
++    weights once more per extra block. Measured on A100 at M=2048 (E=256,
++    topk=6, mxfp4) the 48 rung wins 9.6% under this model's real hash routing,
++    21.9% under a uniform load and 14.0% under a zipf one -- but loses 4.5%
++    under a uniformly random one, which runs 8% MORE padded rows at 48 than at
++    64 because nearly every expert lands just over one 48-block. So the rung
++    cannot be swapped blind.
++
++    Given `padded_rows` from `moe_padded_rows` the call is decided rather than
++    guessed: between these two rungs the kernel is MMA-row bound, so the row
++    count ranks them. It named the faster rung in all eight measured
++    (prefill width, distribution) combinations, including that sign flip,
++    over-predicting the margin by at most 3.5 points.
++
++    Only the top rung is refined, and only against 48. Rungs 16 and 32 measured
++    slower than 48 in all eight of those combinations, so the row count is not
++    the objective down there and extending the candidate set would not be
++    covered by any measurement.
++
++    `padded_rows` has to be read on the host, and `fused_marlin_moe` does not
++    pass it. Over 172 eager calls at M=2048/E=256/topk=6 the rung it picks saves
++    102us per call while the cheapest host read costs 170us; 121us of that is
++    the launch-pipeline stall from the read alone, which is why no cheaper
++    histogram rescues it. A caller that has already synced for other reasons, or
++    that can supply counts it already holds on the host, gets the win for free.
++    Such a caller must also not be inside a cudagraph capture, where a host read
++    is illegal. Passing None reproduces the historical choice exactly.
++    """
++    block_size_m = _ladder_block_size_m(m, topk, num_experts)
++    if (
++        padded_rows is None
++        or block_size_m != ADAPTIVE_BLOCK_SIZE_M_CANDIDATES[-1]
++        or m < ADAPTIVE_BLOCK_SIZE_M_MIN_TOKENS
++    ):
++        return block_size_m
++    smaller, larger = ADAPTIVE_BLOCK_SIZE_M_CANDIDATES
++    return smaller if padded_rows[0] < padded_rows[1] else larger
++
+ 
+ def _fused_marlin_moe(
+     hidden_states: torch.Tensor,
+@@ -330,9 +430,19 @@ def fused_marlin_moe(
+ 
+     # M block size selection logic
+     # TODO: tune this further for specific models
+-    for block_size_m in [8, 16, 32, 48, 64]:
+-        if M * topk / E / block_size_m < 0.9:
+-            break
++    #
++    # No histogram is passed, so this is the ladder and nothing else. Deciding
++    # the top rung from the real expert counts is worth 9.6% of the expert GEMM
++    # at DeepSeek-V4-Flash prefill shapes, and `select_block_size_m` does decide
++    # it correctly, but it cannot pay for itself here: the counts have to be
++    # read on the host, and prefill is eager, so the read stalls the launch
++    # pipeline. Measured on A100 over 172 eager calls at M=2048/E=256/topk=6,
++    # per call: the 48 rung saves 102us, a bare 2-element `.tolist()` costs
++    # 121us on its own, and the cheapest histogram that still lands on the host
++    # costs 170us. The decision is right and the read is 1.7x the prize. See
++    # `select_block_size_m` for the rule, and pass `padded_rows` from anywhere
++    # that has already paid for a sync.
++    block_size_m = select_block_size_m(M, topk, E)
+ 
+     if input_dtype is not None and input_dtype.itemsize == 1:
+         block_size_m = max(block_size_m, 16)

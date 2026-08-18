@@ -1,0 +1,190 @@
+From 1dfb9226c9f1cc63d8065aa5b55477f12107f971 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 11:26:22 +0800
+Subject: [PATCH 19/21] experiment(dspark): shard Markov logits for local
+ argmax
+
+---
+ vllm/model_executor/models/qwen3_dspark.py    | 43 ++++++++++++++++++-
+ vllm/models/deepseek_v4/nvidia/dspark.py      | 14 ++++++
+ .../gpu/spec_decode/dspark/speculator.py      | 30 ++++++++++---
+ 3 files changed, 78 insertions(+), 9 deletions(-)
+
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index d15aa45461..3d3115aa17 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -20,7 +20,7 @@ from collections.abc import Iterable
+ import torch
+ import torch.nn as nn
+ 
+-from vllm.config import VllmConfig
++from vllm.config import VllmConfig, get_current_vllm_config_or_none
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+@@ -35,6 +35,15 @@ from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
+ logger = init_logger(__name__)
+ 
+ 
++def dspark_vocab_shard_enabled() -> bool:
++    config = get_current_vllm_config_or_none()
++    return bool(
++        config is not None
++        and config.speculative_config is not None
++        and config.speculative_config.use_local_argmax_reduction
++    )
++
++
+ class DSparkMarkovHead(nn.Module):
+     """Sequential transition-bias head (low-rank V x r, r x V).
+ 
+@@ -55,8 +64,13 @@ class DSparkMarkovHead(nn.Module):
+         markov_rank: int,
+         prefix: str,
+         quant_config: QuantizationConfig | None = None,
++        *,
++        shard_vocab: bool | None = None,
+     ) -> None:
+         super().__init__()
++        if shard_vocab is None:
++            shard_vocab = dspark_vocab_shard_enabled()
++        self.shard_vocab = shard_vocab
+         self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
+         self.markov_w2 = ParallelLMHead(
+             draft_vocab_size,
+@@ -64,7 +78,7 @@ class DSparkMarkovHead(nn.Module):
+             bias=False,
+             quant_config=quant_config,
+             prefix=maybe_prefix(prefix, "markov_w2"),
+-            disable_tp=True,
++            disable_tp=not shard_vocab,
+         )
+ 
+     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+@@ -79,6 +93,18 @@ class DSparkMarkovHead(nn.Module):
+         """Vocab-size transition bias from a Markov embedding ([B, r] -> [B, V])."""
+         return logits_processor(self.markov_w2, markov_embed)
+ 
++    def select_top_tokens(
++        self,
++        markov_embed: torch.Tensor,
++        base_shard_logits: torch.Tensor,
++        logits_processor: LogitsProcessor,
++    ) -> torch.Tensor:
++        return logits_processor.get_top_tokens(
++            self.markov_w2,
++            markov_embed,
++            extra_logits=base_shard_logits,
++        )
++
+     def apply_bias_gathered(
+         self,
+         markov_embed: torch.Tensor,
+@@ -212,6 +238,19 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
+         # Markov bias in draft space, then remaps via map_draft_to_target.
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
++    def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        return self.logits_processor.get_shard_logits(self.lm_head, hidden_states)
++
++    def select_draft_token_shard(
++        self, markov_embed: torch.Tensor, base_shard_logits: torch.Tensor
++    ) -> torch.Tensor:
++        draft_ids = self.model.markov_head.select_top_tokens(
++            markov_embed,
++            base_shard_logits,
++            self.logits_processor,
++        )
++        return self.map_draft_to_target(draft_ids)
++
+     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+         # Map draft-vocab ids to target ids (identity for full-vocab drafts).
+         if self.draft_id_to_target_id is None:
+diff --git a/vllm/models/deepseek_v4/nvidia/dspark.py b/vllm/models/deepseek_v4/nvidia/dspark.py
+index b702d7ec9c..9eada7c29a 100644
+--- a/vllm/models/deepseek_v4/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4/nvidia/dspark.py
+@@ -367,6 +367,20 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         # Full-vocab draft: base logits, no d2t scatter.
+         return self.compute_logits(hidden_states)
+ 
++    def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        return self.logits_processor.get_shard_logits(
++            self.lm_head, self.model.norm(hidden_states)
++        )
++
++    def select_draft_token_shard(
++        self, markov_embed: torch.Tensor, base_shard_logits: torch.Tensor
++    ) -> torch.Tensor:
++        return self.model.markov_head.select_top_tokens(
++            markov_embed,
++            base_shard_logits,
++            self.logits_processor,
++        )
++
+     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+         return draft_ids  # full-vocab: draft ids are target ids
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 19fc452018..36e7583fae 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -39,6 +39,10 @@ logger = init_logger(__name__)
+ 
+ class DSparkSpeculator(DFlashSpeculator):
+     _speculator_name = "DSpark"
++    _local_argmax_hooks = (
++        "compute_draft_logits_shard",
++        "select_draft_token_shard",
++    )
+ 
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         super().__init__(vllm_config, device)
+@@ -78,6 +82,10 @@ class DSparkSpeculator(DFlashSpeculator):
+         self._draft_topk: int | None = getattr(
+             self.draft_model_config.hf_config, "dspark_draft_topk", None
+         )
++        if self.use_local_argmax_reduction and self._draft_topk is not None:
++            raise ValueError(
++                "DSpark local argmax is incompatible with dspark_draft_topk."
++            )
+ 
+         self.draft_token_confidence_probs = torch.empty_like(
+             self.draft_tokens, dtype=torch.float32
+@@ -159,8 +167,11 @@ class DSparkSpeculator(DFlashSpeculator):
+         num_sample = num_reqs * n_spec
+         # Per-(req, position) head hidden, ordered (req, step).
+         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+-        # Draft-vocab logits; sampled ids are remapped to target vocab below.
+-        base_logits = self.model.compute_draft_logits(sample_hidden)
++        # Draft-vocab logits; local argmax keeps only this TP rank's columns.
++        if self.use_local_argmax_reduction:
++            base_logits = self.model.compute_draft_logits_shard(sample_hidden)
++        else:
++            base_logits = self.model.compute_draft_logits(sample_hidden)
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+ 
+@@ -177,11 +188,16 @@ class DSparkSpeculator(DFlashSpeculator):
+             markov_embed = self.model.markov_embed(prev)
+             if self.enable_adaptive_verification:
+                 confidence_markov_embeds.append(markov_embed)
+-            bias = self.model.markov_bias(markov_embed)
+-            logits_i = base_logits[:, i] + bias
+-            draft_sampled_i = self._sample_logits(
+-                logits_i, idx_map[:, i], sample_pos[:, i], i
+-            )
++            if self.use_local_argmax_reduction:
++                draft_sampled_i = self.model.select_draft_token_shard(
++                    markov_embed, base_logits[:, i]
++                )
++            else:
++                bias = self.model.markov_bias(markov_embed)
++                logits_i = base_logits[:, i] + bias
++                draft_sampled_i = self._sample_logits(
++                    logits_i, idx_map[:, i], sample_pos[:, i], i
++                )
+             self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 
