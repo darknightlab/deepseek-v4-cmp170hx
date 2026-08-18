@@ -1,0 +1,3165 @@
+From 3f82af3bc36a2411b0724de2657f7d590427f7eb Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 18 Aug 2026 10:38:21 +0800
+Subject: [PATCH 1/3] DSv4 SM80: add minimal Ampere correctness support
+
+---
+ csrc/libtorch_stable/ops.h                    |   3 +
+ tests/kernels/attention/test_dsv4_fp8_sm80.py | 124 ++++
+ .../attention/test_mqa_logits_triton.py       | 579 ++++++++++++++++
+ .../test_triton_mla_sparse_kernel.py          | 116 ++++
+ vllm/model_executor/kernels/mhc/tilelang.py   |  34 +-
+ .../layers/sparse_attn_indexer.py             |  57 +-
+ vllm/model_executor/models/deepseek_v2.py     |   5 +
+ vllm/model_executor/warmup/cutedsl_warmup.py  |   3 +
+ .../warmup/sparse_mla_triton_warmup.py        |   1 +
+ vllm/models/deepseek_v32/amd/rocm.py          |   1 +
+ vllm/models/deepseek_v32/attention.py         |   1 +
+ vllm/models/deepseek_v4/amd/rocm.py           |   6 +
+ vllm/models/deepseek_v4/ampere/__init__.py    |   2 +
+ .../deepseek_v4/ampere/ampere_sparse.py       |  32 +
+ vllm/models/deepseek_v4/attention.py          |   1 +
+ .../deepseek_v4/common/ops/cache_utils.py     |  23 +-
+ .../common/ops/fused_compress_quant_cache.py  |   9 +-
+ .../deepseek_v4/common/ops/fused_indexer_q.py |  22 +-
+ vllm/models/deepseek_v4/compressor.py         |  10 +-
+ vllm/models/deepseek_v4/nvidia/model.py       |  19 +
+ vllm/platforms/cuda.py                        |   5 +
+ vllm/utils/import_utils.py                    |  13 +
+ vllm/v1/attention/backends/mla/sparse_swa.py  |   7 +-
+ .../backends/mla/triton_mla_sparse.py         | 110 +++
+ vllm/v1/attention/backends/registry.py        |   6 +
+ vllm/v1/attention/ops/fp8_sm80.py             | 173 +++++
+ vllm/v1/attention/ops/mqa_logits_triton.py    | 645 ++++++++++++++++++
+ .../v1/attention/ops/rocm_aiter_mla_sparse.py |  39 +-
+ .../attention/ops/triton_mla_sparse_kernel.py | 551 +++++++++++++++
+ 29 files changed, 2518 insertions(+), 79 deletions(-)
+ create mode 100644 tests/kernels/attention/test_dsv4_fp8_sm80.py
+ create mode 100644 tests/kernels/attention/test_mqa_logits_triton.py
+ create mode 100644 tests/kernels/attention/test_triton_mla_sparse_kernel.py
+ create mode 100644 vllm/models/deepseek_v4/ampere/__init__.py
+ create mode 100644 vllm/models/deepseek_v4/ampere/ampere_sparse.py
+ create mode 100644 vllm/v1/attention/backends/mla/triton_mla_sparse.py
+ create mode 100644 vllm/v1/attention/ops/fp8_sm80.py
+ create mode 100644 vllm/v1/attention/ops/mqa_logits_triton.py
+ create mode 100644 vllm/v1/attention/ops/triton_mla_sparse_kernel.py
+
+diff --git a/csrc/libtorch_stable/ops.h b/csrc/libtorch_stable/ops.h
+index 5c595bfaf4..536cd03ac3 100644
+--- a/csrc/libtorch_stable/ops.h
++++ b/csrc/libtorch_stable/ops.h
+@@ -401,6 +401,9 @@ void fused_kda_decode(
+     std::optional<torch::stable::Tensor> output_gate,
+     std::optional<torch::stable::Tensor> norm_weight, double norm_eps);
+ 
++#endif
++
++#ifdef VLLM_ENABLE_FUSED_GDN_DECODE
+ void fused_gdn_decode_post_conv_mtp(
+     torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,
+     torch::stable::Tensor const& b, torch::stable::Tensor const& a_log,
+diff --git a/tests/kernels/attention/test_dsv4_fp8_sm80.py b/tests/kernels/attention/test_dsv4_fp8_sm80.py
+new file mode 100644
+index 0000000000..a480148e1f
+--- /dev/null
++++ b/tests/kernels/attention/test_dsv4_fp8_sm80.py
+@@ -0,0 +1,124 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Bit-exactness of the SM80 manual e4m3fn encode/decode helpers.
++
++Wrong rounding here drifts every KV-cache byte and surfaces as gradual
++output corruption, so the encoder must match ``torch.Tensor.to(float8_e4m3fn)``
++bit-for-bit on the clamped domain the kernels feed it, and the ALU decoder
++must invert every byte exactly.
++"""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.fp8_sm80 import (
++    _e4m3fn_to_f32_alu,
++    _f32_to_e4m3fn_u8,
++)
++
++pytestmark = pytest.mark.skipif(
++    not current_platform.is_cuda(), reason="CUDA-only kernels"
++)
++
++
++@triton.jit
++def _encode_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
++    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < n
++    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
++    tl.store(out_ptr + offs, _f32_to_e4m3fn_u8(x), mask=mask)
++
++
++@triton.jit
++def _decode_kernel(u_ptr, out_ptr, n, BLOCK: tl.constexpr):
++    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < n
++    u = tl.load(u_ptr + offs, mask=mask, other=0)
++    tl.store(out_ptr + offs, _e4m3fn_to_f32_alu(u), mask=mask)
++
++
++def _encode(x: torch.Tensor) -> torch.Tensor:
++    out = torch.empty_like(x, dtype=torch.uint8)
++    n = x.numel()
++    _encode_kernel[(triton.cdiv(n, 1024),)](x, out, n, BLOCK=1024)
++    return out
++
++
++def _decode(u: torch.Tensor) -> torch.Tensor:
++    out = torch.empty_like(u, dtype=torch.float32)
++    n = u.numel()
++    _decode_kernel[(triton.cdiv(n, 1024),)](u, out, n, BLOCK=1024)
++    return out
++
++
++def _assert_bytes_equal(got: torch.Tensor, ref: torch.Tensor, inputs: torch.Tensor):
++    if not torch.equal(got, ref):
++        bad = (got != ref).nonzero()[:10].flatten()
++        raise AssertionError(
++            f"{bad.numel()}+ mismatches, first at inputs "
++            f"{inputs.flatten()[bad].tolist()}: got "
++            f"{got.flatten()[bad].tolist()} ref {ref.flatten()[bad].tolist()}"
++        )
++
++
++def test_encoder_matches_torch_on_clamped_domain():
++    """Kernels always clamp to +-448 before encoding; on that domain the
++    manual encoder must equal torch's cast bitwise (RNE incl. ties)."""
++    torch.manual_seed(0)
++    xs = [
++        (torch.rand(1_000_000, device="cuda") * 2 - 1) * 448.0,
++        # log-uniform sweep into the subnormal range
++        torch.exp2(torch.rand(1_000_000, device="cuda") * 30 - 21)
++        * torch.where(torch.rand(1_000_000, device="cuda") > 0.5, 1.0, -1.0),
++    ]
++    x = torch.cat(xs).float()
++    ref = x.to(torch.float8_e4m3fn).view(torch.uint8)
++    _assert_bytes_equal(_encode(x), ref, x)
++
++
++def test_encoder_exact_ties_and_boundaries():
++    vals = []
++    # every representable value: exact roundtrip required
++    all_bytes = torch.arange(256, dtype=torch.uint8, device="cuda")
++    finite = all_bytes[(all_bytes & 0x7F) != 0x7F]
++    vals.append(finite.view(torch.float8_e4m3fn).float())
++    # exact midpoints between adjacent representables (RNE ties-to-even),
++    # generated from consecutive finite positives
++    pos = torch.sort(vals[0][vals[0] >= 0]).values
++    mids = (pos[:-1] + pos[1:]) / 2
++    vals += [mids, -mids]
++    # boundary/overflow: values at and beyond max finite saturate to +-448
++    vals.append(
++        torch.tensor(
++            [448.0, 449.0, 455.9, 456.0, 464.0, 1e30, -1e30, 0.0, -0.0],
++            device="cuda",
++        )
++    )
++    # deep subnormals and half-min-subnormal ties
++    vals.append(
++        torch.tensor(
++            [2**-9, 2**-10, 1.5 * 2**-10, 2**-11, 2**-20, -(2**-10)],
++            device="cuda",
++        )
++    )
++    x = torch.cat([v.float().flatten() for v in vals])
++    ref = x.to(torch.float8_e4m3fn).view(torch.uint8)
++    _assert_bytes_equal(_encode(x), ref, x)
++
++
++def test_alu_decoder_all_bytes():
++    """ALU decode must match torch's fp8->f32 for all 256 bytes, incl. the
++    two NaN encodings (NaN in, NaN out -- keeps NaN scrubbing identical)."""
++    u = torch.arange(256, dtype=torch.uint8, device="cuda")
++    got = _decode(u)
++    ref = u.view(torch.float8_e4m3fn).float()
++    assert torch.equal(got.nan_to_num(1234.5), ref.nan_to_num(1234.5))
++    assert got[(u & 0x7F) == 0x7F].isnan().all()
++
++
++def test_roundtrip_all_finite_bytes():
++    u = torch.arange(256, dtype=torch.uint8, device="cuda")
++    finite = u[(u & 0x7F) != 0x7F]
++    assert torch.equal(_encode(_decode(finite)), finite)
+diff --git a/tests/kernels/attention/test_mqa_logits_triton.py b/tests/kernels/attention/test_mqa_logits_triton.py
+new file mode 100644
+index 0000000000..939a05f091
+--- /dev/null
++++ b/tests/kernels/attention/test_mqa_logits_triton.py
+@@ -0,0 +1,579 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Correctness tests for the Triton MQA logits kernels."""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++from vllm.utils.math_utils import cdiv
++from vllm.v1.attention.ops import mqa_logits_triton as mqa_logits_mod
++from vllm.v1.attention.ops.mqa_logits_triton import (
++    fp8_mqa_logits_triton,
++    fp8_paged_mqa_logits_triton,
++)
++
++pytestmark = pytest.mark.skipif(
++    not current_platform.is_cuda_alike(),
++    reason="Triton MQA logits kernels require CUDA/ROCm",
++)
++
++
++def _quantize_k_per_row(
++    k_bf16: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    amax = k_bf16.abs().float().amax(dim=-1, keepdim=True).clamp_min(1e-4)
++    sf = amax / 448.0
++    k_fp8 = (k_bf16.float() / sf).to(torch.float8_e4m3fn)
++    return k_fp8, sf.squeeze(-1)
++
++
++def _pack_paged_kv(kv_bf16: torch.Tensor) -> torch.Tensor:
++    """Pack BF16 KV into the layout produced by `indexer_k_quant_and_cache`.
++
++    Physical bytes per block are segregated: all `block_size * head_dim` fp8 K
++    bytes first, then `block_size * 4` fp32 scale bytes. The outer
++    `[NB, BS, 1, D+4]` shape matches the production cache allocation.
++    """
++    num_blocks, block_size, head_dim = kv_bf16.shape
++    amax = kv_bf16.abs().float().amax(dim=-1, keepdim=True).clamp_min(1e-4)
++    sf = (amax / 448.0).to(torch.float32)
++    k_fp8 = (kv_bf16.float() / sf).to(torch.float8_e4m3fn)
++    packed = torch.empty(
++        (num_blocks, block_size, 1, head_dim + 4),
++        dtype=torch.uint8,
++        device=kv_bf16.device,
++    )
++    flat = packed.view(num_blocks, -1)
++    k_end = block_size * head_dim
++    flat[:, :k_end] = k_fp8.reshape(num_blocks, -1).view(torch.uint8)
++    flat[:, k_end:] = sf.reshape(num_blocks, -1).view(torch.uint8)
++    return packed
++
++
++# References adapted from DeepGEMM (test_attention.py) — used as the spec
++# the Triton kernels must agree with.
++def _fp8_mqa_logits_ref(
++    q: torch.Tensor,
++    kv: tuple[torch.Tensor, torch.Tensor],
++    weights: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++) -> torch.Tensor:
++    k_fp8, scale = kv
++    seq_len_kv = k_fp8.shape[0]
++    k = k_fp8.to(torch.bfloat16)
++    q = q.to(torch.bfloat16)
++    arange = torch.arange(0, seq_len_kv, device=q.device)[None, :]
++    mask = (arange >= cu_seqlen_ks[:, None]) & (arange < cu_seqlen_ke[:, None])
++    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale
++    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
++    return logits.masked_fill(~mask, float("-inf"))
++
++
++def _fp8_paged_mqa_logits_ref(
++    q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    weights: torch.Tensor,
++    context_lens: torch.Tensor,
++    block_tables: torch.Tensor,
++    max_model_len: int,
++) -> torch.Tensor:
++    fp8_dtype = torch.float8_e4m3fn
++    batch_size, next_n, _, dim = q.size()
++    num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
++    flat = kv_cache.view(num_blocks, -1)
++    k_end = block_size * dim
++    kv_data = (
++        flat[:, :k_end].reshape(num_blocks, block_size, 1, dim).view(fp8_dtype).float()
++    )
++    scale = flat[:, k_end:].view(torch.float32).reshape(num_blocks, block_size, 1, 1)
++    q = q.float()
++    kv_data = kv_data * scale
++    logits = torch.full(
++        [batch_size * next_n, max_model_len],
++        float("-inf"),
++        device=q.device,
++        dtype=torch.float32,
++    )
++    context_lens_list = context_lens.tolist()
++    for i in range(batch_size):
++        context_len = context_lens_list[i]
++        q_offsets = torch.arange(context_len - next_n, context_len, device=q.device)
++        weight_slice = (
++            weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
++        )
++        for block_rk in range(cdiv(context_len, block_size)):
++            block_idx = block_tables[i][block_rk]
++            qx, kx = q[i], kv_data[block_idx]
++            k_offsets = torch.arange(
++                block_rk * block_size,
++                (block_rk + 1) * block_size,
++                device=q.device,
++            )
++            mask = (k_offsets[None, :] < context_len) & (
++                k_offsets[None, :] <= q_offsets[:, None]
++            )
++            s = torch.where(
++                mask[None, :, :],
++                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(
++                    logits.dtype
++                ),
++                float("-inf"),
++            )
++            s = (torch.relu(s) * weight_slice[..., None]).sum(dim=0)
++            block_start = block_rk * block_size
++            block_end = min((block_rk + 1) * block_size, max_model_len)
++            block_width = block_end - block_start
++            logits[
++                i * next_n : (i + 1) * next_n,
++                block_start:block_end,
++            ] = torch.where(
++                k_offsets[None, :block_width] <= q_offsets[:, None],
++                s[:, :block_width],
++                float("-inf"),
++            )
++    return logits
++
++
++# Looser tolerance to accommodate FP8 rounding and the paged torch
++# reference using fp32 matmul while the triton kernel uses bf16 matmul
++# (with an fp32 accumulator, matching the DeepGEMM path).
++_ATOL = 1.0
++_RTOL = 0.2
++
++
++# (8, 16640) crosses only _KV_GROUP_MIN_N and remains on the ungrouped path;
++# it is the long-context regression shape for the new M gate.
++@pytest.mark.parametrize("M,N", [(64, 64), (128, 256), (256, 512), (8, 16640)])
++@pytest.mark.parametrize("num_heads", [16, 32])
++@pytest.mark.parametrize("partial_mask", [False, True])
++@pytest.mark.parametrize("clean_logits", [True, False])
++def test_fp8_mqa_logits_triton_matches_torch(
++    M, N, num_heads, partial_mask, clean_logits
++):
++    """`clean_logits=True` requires full-tensor agreement with the reference;
++    `clean_logits=False` is only contractually correct on the in-range
++    `[ks, ke)` slots, which is what `finite` already masks here (the reference
++    writes -inf outside that range)."""
++    torch.manual_seed(0)
++    head_dim = 128
++    device = "cuda"
++
++    q_bf16 = torch.randn(M, num_heads, head_dim, dtype=torch.bfloat16, device=device)
++    k_bf16 = torch.randn(N, head_dim, dtype=torch.bfloat16, device=device)
++    weights = torch.randn(M, num_heads, dtype=torch.float32, device=device)
++    q_fp8 = q_bf16.to(torch.float8_e4m3fn)
++    k_fp8, k_scales = _quantize_k_per_row(k_bf16)
++
++    if partial_mask:
++        # Exercise the non-trivial ks/ke masking branch (chunked prefill).
++        ks = torch.arange(M, dtype=torch.int32, device=device) % (N // 4)
++        ke = ks + torch.randint(1, N // 2, (M,), dtype=torch.int32, device=device)
++        ke = torch.minimum(ke, torch.tensor(N, dtype=torch.int32, device=device))
++    else:
++        ks = torch.zeros(M, dtype=torch.int32, device=device)
++        ke = torch.full((M,), N, dtype=torch.int32, device=device)
++
++    out_torch = _fp8_mqa_logits_ref(q_fp8, (k_fp8, k_scales), weights, ks, ke)
++    out_triton = fp8_mqa_logits_triton(
++        q_fp8, (k_fp8, k_scales), weights, ks, ke, clean_logits=clean_logits
++    )
++
++    if clean_logits:
++        assert torch.equal(
++            torch.isinf(out_torch) & (out_torch < 0),
++            torch.isinf(out_triton) & (out_triton < 0),
++        )
++    finite = ~torch.isinf(out_torch)
++    if finite.any():
++        torch.testing.assert_close(
++            out_triton[finite], out_torch[finite], atol=_ATOL, rtol=_RTOL
++        )
++
++
++@pytest.mark.parametrize(
++    "is_sm80,M,N,expected",
++    [
++        # The gate is on the GROUPED grid's CTA count, not on M: grouping
++        # divides the grid's N dimension by KV_GROUP, so a small M with a wide
++        # N still fills the machine while a small M with a narrow N does not.
++        # Every row below is a measured corner (see the module's table).
++        (True, 240, 61440, 8),  # the served 256k shape; M>=512 missed it
++        (True, 8, 16384, 1),  # 128 grouped CTAs < one wave: grouping loses
++        (True, 8, 61440, 8),  # 480 grouped CTAs: same M, wide N, wins
++        (True, 32, 16384, 8),  # 512 grouped CTAs
++        (True, 8, 16640, 1),
++        (True, 512, 16383, 1),  # N gate still binds independently
++        (True, 512, 16384, 8),
++        (True, 2048, 28672, 8),
++        (False, 2048, 28672, 1),
++    ],
++)
++def test_fp8_mqa_logits_group_dispatch_boundaries(monkeypatch, is_sm80, M, N, expected):
++    monkeypatch.setattr(mqa_logits_mod, "_IS_SM80", is_sm80)
++    # Pin the wave size so this asserts the gate's arithmetic, not the SM
++    # count of whichever GPU runs the suite (A100 = 108 x 3 = 324).
++    monkeypatch.setattr(mqa_logits_mod, "_kv_group_min_ctas", lambda _idx: 324)
++    assert mqa_logits_mod._select_prefill_kv_group(M, N) == expected
++
++
++@pytest.mark.parametrize(
++    "is_sm80,expected_calls",
++    [
++        (False, [(8, 8192, None)]),
++        (True, [(8, 8192, None), (8, 16384, 8)]),
++    ],
++)
++def test_fp8_mqa_logits_warmup_forces_grouped_specialization(
++    monkeypatch, is_sm80, expected_calls
++):
++    calls = []
++
++    def record_shape(num_heads, head_dim, m, n, device, kv_group_override=None) -> None:
++        calls.append((m, n, kv_group_override))
++
++    monkeypatch.setattr(mqa_logits_mod, "_warmup_fp8_mqa_logits_shape", record_shape)
++    monkeypatch.setattr(mqa_logits_mod, "_IS_SM80", is_sm80)
++    mqa_logits_mod.warmup_fp8_mqa_logits_triton(64, 128, torch.device("cuda:0"))
++    assert calls == expected_calls
++
++
++def test_fp8_mqa_logits_triton_clean_logits_false_overwrites_masked():
++    """Regression test for PR #38476 comment 4398225404: when `clean_logits=False`
++    skips the `-inf` pre-fill, the kernel itself must still write `-inf` to
++    masked positions. Otherwise the K-tile early-exit branch leaves
++    uninitialized memory in the output, downstream top-k reads garbage, and the
++    model collapses to repeating a single token.
++
++    Trigger: a narrow per-row `[ks, ke)` so that BLOCK_N tiles past every row's
++    `ke` hit the early-exit path. We assert that `clean_logits=False` produces
++    bit-identical output to `clean_logits=True` on every position (the flag is
++    a perf opt, not a behavior change)."""
++    torch.manual_seed(0)
++    M, N, num_heads, head_dim = 256, 1024, 32, 128
++    device = "cuda"
++
++    q_fp8 = torch.randn(M, num_heads, head_dim, dtype=torch.bfloat16, device=device).to(
++        torch.float8_e4m3fn
++    )
++    k_bf16 = torch.randn(N, head_dim, dtype=torch.bfloat16, device=device)
++    weights = torch.randn(M, num_heads, dtype=torch.float32, device=device)
++    k_fp8, k_scales = _quantize_k_per_row(k_bf16)
++
++    # Narrow per-row range: most rows' `[ks, ke)` cover ~1/16 of N, so most
++    # K-tiles past `ke` hit the kernel's early-exit branch.
++    ks = torch.arange(M, dtype=torch.int32, device=device) % (N // 8)
++    ke = ks + N // 16
++    ke = torch.minimum(ke, torch.full_like(ke, N))
++
++    out_clean = fp8_mqa_logits_triton(
++        q_fp8, (k_fp8, k_scales), weights, ks, ke, clean_logits=True
++    )
++    out_dirty = fp8_mqa_logits_triton(
++        q_fp8, (k_fp8, k_scales), weights, ks, ke, clean_logits=False
++    )
++
++    # Every position the clean run wrote `-inf` to (i.e. outside `[ks, ke)`)
++    # must also be `-inf` in the dirty run — otherwise the early-exit left
++    # uninitialized memory and downstream top-k will pick from garbage.
++    inf_mask = torch.isinf(out_clean) & (out_clean < 0)
++    bad = inf_mask & ~(torch.isinf(out_dirty) & (out_dirty < 0))
++    if bad.any():
++        # Surface a useful error: how many positions, and a sample of the
++        # leaked values so it's obvious they're not `-inf`.
++        leaked_count = int(bad.sum().item())
++        sample = out_dirty[bad].flatten()[:8].tolist()
++        raise AssertionError(
++            f"clean_logits=False left {leaked_count} positions un-initialised "
++            f"(should be -inf). Sample leaked values: {sample}. "
++            "Likely cause: the kernel's K-tile early-exit branch returns "
++            "without writing -inf, so downstream top-k reads garbage."
++        )
++
++
++@pytest.mark.parametrize(
++    "batch_size,next_n,context_len",
++    [
++        (1, 1, 128),
++        (1, 1, 512),
++        (2, 1, 256),
++        (1, 4, 512),  # speculative decoding with next_n=4
++        (2, 4, 130),  # active max length is not block-aligned
++    ],
++)
++@pytest.mark.parametrize("num_heads", [16, 32])
++@pytest.mark.parametrize("clean_logits", [True, False])
++def test_fp8_paged_mqa_logits_triton_matches_torch(
++    batch_size, next_n, context_len, num_heads, clean_logits
++):
++    """`clean_logits=True` requires whole-tensor agreement; `clean_logits=False`
++    is only correct on `[:, :context_len]` (downstream topk reads only that
++    range), so all comparisons below are sliced accordingly."""
++    torch.manual_seed(0)
++    head_dim = 128
++    block_size = 64
++    device = "cuda"
++
++    total_blocks = 64
++    max_blocks = (context_len + block_size - 1) // block_size + 4
++
++    kv_bf16 = torch.randn(
++        total_blocks, block_size, head_dim, dtype=torch.bfloat16, device=device
++    )
++    kv_packed = _pack_paged_kv(kv_bf16)
++
++    q_fp8 = torch.randn(
++        batch_size,
++        next_n,
++        num_heads,
++        head_dim,
++        dtype=torch.bfloat16,
++        device=device,
++    ).to(torch.float8_e4m3fn)
++
++    weights = torch.randn(
++        batch_size * next_n, num_heads, dtype=torch.float32, device=device
++    )
++
++    context_lens = torch.full(
++        (batch_size,), context_len, dtype=torch.int32, device=device
++    )
++    block_tables = torch.randint(
++        0,
++        total_blocks,
++        (batch_size, max_blocks),
++        dtype=torch.int32,
++        device=device,
++    )
++
++    max_model_len = context_len
++
++    out_torch = _fp8_paged_mqa_logits_ref(
++        q_fp8, kv_packed, weights, context_lens, block_tables, max_model_len
++    )
++    out_triton = fp8_paged_mqa_logits_triton(
++        q_fp8,
++        kv_packed,
++        weights,
++        context_lens,
++        block_tables,
++        max_model_len,
++        clean_logits=clean_logits,
++    )
++
++    inf_torch = (torch.isinf(out_torch) & (out_torch < 0))[:, :context_len]
++    inf_triton = (torch.isinf(out_triton) & (out_triton < 0))[:, :context_len]
++    assert torch.equal(inf_torch, inf_triton)
++    finite = ~inf_torch
++    if finite.any():
++        torch.testing.assert_close(
++            out_triton[:, :context_len][finite],
++            out_torch[:, :context_len][finite],
++            atol=_ATOL,
++            rtol=_RTOL,
++        )
++
++
++def test_fp8_paged_mqa_logits_triton_strided_pool_no_int32_overflow():
++    """Unified-KV-pool layer views have a large block stride; with enough
++    blocks, int32 `block_idx * stride` exceeds 2**31 and wraps to a negative
++    offset (IMA, or silent corruption when the wrapped address is mapped).
++    Uses a padded pool whose stride puts the referenced blocks past the
++    overflow threshold and checks parity against the torch reference."""
++    torch.manual_seed(0)
++    head_dim = 128
++    block_size = 64
++    batch_size, next_n, num_heads = 2, 1, 16
++    context_len = 256
++    device = "cuda"
++
++    # Row payload is block_size * (head_dim + 4) = 8448 B; pad the pool block
++    # stride to 2 MiB so int32 wraps at block_idx >= 2**31 / 2**21 = 1024.
++    pool_stride = 2**21
++    total_blocks = 1040
++
++    row_elems = block_size * (head_dim + 4)
++    kv_bf16 = torch.randn(
++        total_blocks, block_size, head_dim, dtype=torch.bfloat16, device=device
++    )
++    kv_contig = _pack_paged_kv(kv_bf16)
++
++    backing = torch.zeros(total_blocks * pool_stride, dtype=torch.uint8, device=device)
++    kv_strided = backing.as_strided(
++        (total_blocks, block_size, 1, head_dim + 4),
++        (pool_stride, head_dim + 4, head_dim + 4, 1),
++    )
++    kv_strided.copy_(kv_contig.view(total_blocks, block_size, 1, head_dim + 4))
++    assert kv_strided.view(total_blocks, -1).stride(0) == pool_stride
++    assert kv_strided.view(total_blocks, -1).shape[1] == row_elems
++
++    q_fp8 = torch.randn(
++        batch_size, next_n, num_heads, head_dim, dtype=torch.bfloat16, device=device
++    ).to(torch.float8_e4m3fn)
++    weights = torch.randn(
++        batch_size * next_n, num_heads, dtype=torch.float32, device=device
++    )
++    context_lens = torch.full(
++        (batch_size,), context_len, dtype=torch.int32, device=device
++    )
++    # Every referenced block sits past the int32 overflow threshold.
++    max_blocks = (context_len + block_size - 1) // block_size
++    block_tables = torch.randint(
++        1024,
++        total_blocks,
++        (batch_size, max_blocks),
++        dtype=torch.int32,
++        device=device,
++    )
++
++    out_torch = _fp8_paged_mqa_logits_ref(
++        q_fp8, kv_strided, weights, context_lens, block_tables, context_len
++    )
++    out_triton = fp8_paged_mqa_logits_triton(
++        q_fp8,
++        kv_strided,
++        weights,
++        context_lens,
++        block_tables,
++        context_len,
++        clean_logits=True,
++    )
++
++    inf_torch = torch.isinf(out_torch) & (out_torch < 0)
++    inf_triton = torch.isinf(out_triton) & (out_triton < 0)
++    assert torch.equal(inf_torch, inf_triton)
++    finite = ~inf_torch
++    torch.testing.assert_close(
++        out_triton[finite], out_torch[finite], atol=_ATOL, rtol=_RTOL
++    )
++
++
++def _spread_k_scales(n: int, device: torch.device) -> torch.Tensor:
++    """Per-row quantization scales spanning orders of magnitude.
++
++    Canon rule 34: a distribution that makes the property trivially true makes
++    the test unable to fail. Real activations of this model drive per-row fp8
++    scales apart by ~2 decades, and it is exactly that spread that decides
++    whether reordering the head sum's scaling can move a near-tie. Uniform
++    scales cannot fail this test.
++    """
++    exponent = torch.linspace(-2.0, 2.0, n, device=device)
++    return (10.0**exponent).to(torch.float32)
++
++
++@pytest.mark.parametrize("kv_group", [1, 8])
++def test_factored_k_scale_keeps_the_relu_active_set_and_the_selection(
++    monkeypatch, kv_group
++):
++    """K7: hoisting `k_scale` out of the relu.
++
++    `out = sum_h w_h * relu(k_scale * s)` becomes
++    `out = k_scale * sum_h w_h * relu(s)`, exact in real arithmetic because
++    `k_scale >= 0` and relu is positively homogeneous.
++
++    What that argument does and does not buy, measured here rather than
++    assumed:
++
++    * The relu's ACTIVE SET is untouched -- a non-negative scale cannot move a
++      sign. That is exact and asserted exactly.
++    * The SELECTION is not guaranteed. The scaling happens once instead of
++      BLOCK_H times, so the head sum rounds differently, and on inputs with
++      the real spread (scales over ~4 decades, signed `weights_proj` output)
++      the perturbation reaches ~3e-3 against a tightest top-k boundary gap of
++      ~9e-4. The perturbation is therefore large enough to cross a near-tie
++      even though none of these rows does. The relative error is cancellation
++      in the signed head sum, not the factoring: with non-negative weights the
++      same inputs agree to 2.8e-7.
++
++    So this change carries a quality gate, not a selection-identity gate --
++    which is the opposite of what a uniform-scale test would have suggested
++    (canon rule 34).
++    """
++    device = torch.device("cuda")
++    torch.manual_seed(0)
++    M, N, H, D = 64, 4096, 64, 128
++
++    q_fp8 = torch.randn(M, H, D, dtype=torch.bfloat16, device=device).to(
++        torch.float8_e4m3fn
++    )
++    k_fp8 = torch.randn(N, D, dtype=torch.bfloat16, device=device).to(
++        torch.float8_e4m3fn
++    )
++    k_scales = _spread_k_scales(N, device)
++    weights = torch.randn(M, H, dtype=torch.float32, device=device)
++    ks = torch.zeros(M, dtype=torch.int32, device=device)
++    ke = torch.full((M,), N, dtype=torch.int32, device=device)
++
++    outs = {}
++    for factored in (False, True):
++        monkeypatch.setattr(
++            mqa_logits_mod.envs, "VLLM_INDEXER_LOGITS_FACTOR_K_SCALE", factored
++        )
++        outs[factored] = mqa_logits_mod._fp8_mqa_logits_triton_impl(
++            q_fp8, (k_fp8, k_scales), weights, ks, ke, kv_group
++        ).clone()
++
++    ref, factored_out = outs[False], outs[True]
++    # Which entries the relu zeroed is the observable half of "no sign moved",
++    # and it is exact in both variants.
++    assert torch.equal(ref == 0, factored_out == 0)
++
++    # The logits move by rounding only: bound the change against the size of
++    # the summands, not against the (cancelling) sum.
++    summand_scale = ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-30)
++    assert ((ref - factored_out).abs() / summand_scale).max() < 1e-4
++
++    # Fixed seed, so this is a deterministic regression guard on the property
++    # the indexer actually consumes -- not a proof that it cannot move.
++    k = 512
++    sel_ref = torch.topk(ref, k, dim=-1).indices.sort(dim=-1).values
++    sel_new = torch.topk(factored_out, k, dim=-1).indices.sort(dim=-1).values
++    assert torch.equal(sel_ref, sel_new)
++
++
++def test_paged_q_lut_hoist_is_bit_identical(monkeypatch):
++    """K1: decoding q on the host must reproduce the in-kernel LUT exactly.
++
++    Same 256-entry table (NaN pinned to +-480), same bf16 operands into the
++    same `tl.dot`, same fp32 accumulate -- so this is an equality assert, not
++    a tolerance. The NaN encodings are included deliberately: they are the
++    only bytes where the table and a plain fp8->bf16 cast disagree, so a
++    version that used `.to(bfloat16)` instead of the table would fail here.
++    """
++    device = torch.device("cuda")
++    torch.manual_seed(0)
++    B, next_n, H, D = 3, 6, 64, 128
++    block_size, num_blocks = 64, 32
++
++    q_bytes = torch.randint(
++        0, 256, (B, next_n, H, D), dtype=torch.uint8, device=device
++    )
++    q_bytes[0, 0, 0, :2] = torch.tensor([0x7F, 0xFF], dtype=torch.uint8,
++                                        device=device)
++    q = q_bytes.view(torch.float8_e4m3fn)
++    kv_cache = _pack_paged_kv(
++        torch.randn(num_blocks, block_size, D, dtype=torch.bfloat16, device=device)
++    )
++    weights = torch.randn(B * next_n, H, dtype=torch.float32, device=device)
++    context_lens = torch.full((B,), num_blocks * block_size // 2,
++                              dtype=torch.int32, device=device)
++    block_tables = torch.arange(
++        num_blocks, dtype=torch.int32, device=device
++    ).view(1, -1).repeat(B, 1).contiguous()
++
++    outs = {}
++    for hoisted in (False, True):
++        monkeypatch.setattr(
++            mqa_logits_mod.envs, "VLLM_INDEXER_PAGED_Q_BF16", hoisted
++        )
++        outs[hoisted] = fp8_paged_mqa_logits_triton(
++            q,
++            kv_cache,
++            weights,
++            context_lens,
++            block_tables,
++            max_model_len=num_blocks * block_size,
++        ).clone()
++
++    assert torch.equal(outs[False], outs[True])
+diff --git a/tests/kernels/attention/test_triton_mla_sparse_kernel.py b/tests/kernels/attention/test_triton_mla_sparse_kernel.py
+new file mode 100644
+index 0000000000..0522341d9e
+--- /dev/null
++++ b/tests/kernels/attention/test_triton_mla_sparse_kernel.py
+@@ -0,0 +1,116 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Correctness tests for the Triton sparse MLA kernel.
++
++Compares split-KV against the single-pass (`num_kv_splits=1`) path
++produced by the same kernel — both paths must agree to within bf16 ULPs.
++"""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
++    _DIM_QK,
++    triton_mla_sparse_attention,
++)
++
++pytestmark = pytest.mark.skipif(
++    not current_platform.is_cuda_alike(),
++    reason="Triton sparse MLA kernel requires CUDA/ROCm",
++)
++
++
++@pytest.fixture(scope="module")
++def kv_cache():
++    torch.manual_seed(0)
++    return torch.randn(32768, 1, _DIM_QK, dtype=torch.bfloat16, device="cuda")
++
++
++def _assert_split_matches_single_pass(
++    num_tokens: int,
++    num_heads: int,
++    topk: int,
++    num_kv_splits: int | None,
++    kv_cache: torch.Tensor,
++) -> None:
++    torch.manual_seed(0)
++    q = torch.randn(num_tokens, num_heads, _DIM_QK, dtype=torch.bfloat16, device="cuda")
++    indices = torch.randint(
++        0, kv_cache.shape[0], (num_tokens, 1, topk), dtype=torch.int32, device="cuda"
++    )
++    out_ref = triton_mla_sparse_attention(
++        q,
++        kv_cache,
++        indices,
++        sm_scale=0.1,
++        num_kv_splits=1,
++    )
++    out = triton_mla_sparse_attention(
++        q,
++        kv_cache,
++        indices,
++        sm_scale=0.1,
++        num_kv_splits=num_kv_splits,
++    )
++    torch.testing.assert_close(
++        out.float(),
++        out_ref.float(),
++        atol=5e-2,
++        rtol=5e-3,
++    )
++
++
++@pytest.mark.parametrize(
++    "num_tokens,num_heads",
++    [(1, 16), (1, 128), (8, 32), (32, 128), (128, 16)],
++)
++@pytest.mark.parametrize("topk", [1024, 2048, 4096])
++@pytest.mark.parametrize("num_kv_splits", [2, 4, 8])
++def test_split_kv_matches_single_pass(
++    num_tokens, num_heads, topk, num_kv_splits, kv_cache
++):
++    _assert_split_matches_single_pass(
++        num_tokens,
++        num_heads,
++        topk,
++        num_kv_splits,
++        kv_cache,
++    )
++
++
++@pytest.mark.parametrize("num_tokens", [1, 8, 32, 128])
++def test_auto_split_matches_single_pass(num_tokens, kv_cache):
++    _assert_split_matches_single_pass(
++        num_tokens,
++        num_heads=128,
++        topk=2048,
++        num_kv_splits=None,
++        kv_cache=kv_cache,
++    )
++
++
++@pytest.mark.parametrize("num_kv_splits", [1, 2, 4, 8])
++def test_short_prefill_no_nan(num_kv_splits, kv_cache):
++    """Regression: short prefill where most topk slots are -1 sentinels.
++
++    The indexer fills 2048 topk positions with only a handful of valid
++    indices; the rest are -1. Before the NEG_LARGE sentinel fix, the online
++    softmax produced NaN via `max(-inf, -inf) = -inf` and
++    `exp2(-inf − -inf) = NaN`, poisoning every split.
++    """
++    torch.manual_seed(0)
++    num_tokens, num_heads, topk = 5, 16, 2048
++    q = torch.randn(num_tokens, num_heads, _DIM_QK, dtype=torch.bfloat16, device="cuda")
++    indices = torch.full((num_tokens, 1, topk), -1, dtype=torch.int32, device="cuda")
++    # Only the first `t+1` slots of each query hold valid indices; the
++    # remaining ~2045 slots are -1, producing many all-invalid BLOCK_N tiles.
++    for t in range(num_tokens):
++        indices[t, 0, : t + 1] = torch.arange(
++            64, 64 + t + 1, dtype=torch.int32, device="cuda"
++        )
++    out = triton_mla_sparse_attention(
++        q, kv_cache, indices, sm_scale=0.0417, num_kv_splits=num_kv_splits
++    )
++    assert not torch.isnan(out).any()
++    assert not torch.isinf(out).any()
+diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
+index c3c773d07f..ca90334ecc 100644
+--- a/vllm/model_executor/kernels/mhc/tilelang.py
++++ b/vllm/model_executor/kernels/mhc/tilelang.py
+@@ -348,7 +348,13 @@ def mhc_pre_broadcast_tilelang(
+     residual_flat = residual
+     num_tokens = residual.shape[0]
+ 
+-    n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
++    from vllm.utils.deep_gemm import is_deep_gemm_supported
++
++    use_deep_gemm = is_deep_gemm_supported()
++    if use_deep_gemm:
++        n_splits = compute_num_split(64, hidden_size, cdiv(num_tokens, 64))
++    else:
++        n_splits = 1
+ 
+     residual_out = torch.empty(
+         num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
+@@ -369,15 +375,25 @@ def mhc_pre_broadcast_tilelang(
+         n_splits, num_tokens, dtype=torch.float32, device=residual.device
+     )
+ 
+-    from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
++    if use_deep_gemm:
++        from vllm.utils.deep_gemm import tf32_hc_prenorm_gemm
+ 
+-    tf32_hc_prenorm_gemm(
+-        residual_flat,
+-        fn_broadcast,
+-        gemm_out_mul,
+-        gemm_out_sqrsum,
+-        n_splits,
+-    )
++        tf32_hc_prenorm_gemm(
++            residual_flat,
++            fn_broadcast,
++            gemm_out_mul,
++            gemm_out_sqrsum,
++            n_splits,
++        )
++    else:
++        _tilelang_hc_prenorm_gemm(
++            residual_flat,
++            fn_broadcast,
++            gemm_out_mul,
++            gemm_out_sqrsum,
++            hidden_size,
++            1,
++        )
+     mhc_pre_big_fuse_broadcast_with_norm_tilelang(
+         gemm_out_mul,
+         gemm_out_sqrsum,
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index d94b377dbe..d556480634 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -23,6 +23,7 @@ from vllm.utils.deep_gemm import (
+     fp8_fp4_mqa_logits,
+     fp8_fp4_paged_mqa_logits,
+     has_deep_gemm,
++    is_deep_gemm_supported,
+ )
+ from vllm.utils.import_utils import has_cutedsl
+ from vllm.utils.torch_utils import (
+@@ -35,6 +36,10 @@ from vllm.v1.attention.backends.mla.indexer import (
+     DeepseekV32IndexerMetadata,
+ )
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops.mqa_logits_triton import (
++    fp8_mqa_logits_triton,
++    fp8_paged_mqa_logits_triton,
++)
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ logger = init_logger(__name__)
+@@ -375,6 +380,7 @@ def sparse_attn_indexer(
+         assert q_scale is not None, "use_fp4_cache=True requires q_scale"
+     else:
+         assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
++    use_deep_gemm = is_deep_gemm_supported()
+ 
+     # During speculative decoding, k may be padded to the CUDA graph batch
+     # size while slot_mapping only covers actual tokens. Truncate k to avoid
+@@ -496,7 +502,7 @@ def sparse_attn_indexer(
+                         cu_seqlen_ks,
+                         cu_seqlen_ke,
+                     )
+-                else:
++                elif use_deep_gemm:
+                     logits = fp8_fp4_mqa_logits(
+                         (q_slice_cast, q_scale_slice),
+                         (k_quant_cast, k_scale_cast),
+@@ -505,6 +511,15 @@ def sparse_attn_indexer(
+                         cu_seqlen_ke,
+                         clean_logits=False,
+                     )
++                else:
++                    logits = fp8_mqa_logits_triton(
++                        q_slice_cast,
++                        (k_quant_cast, k_scale_cast),
++                        weights[chunk.token_start : chunk.token_end],
++                        cu_seqlen_ks,
++                        cu_seqlen_ke,
++                        clean_logits=False,
++                    )
+                 num_rows = logits.shape[0]
+                 ops.top_k_per_row_prefill(
+                     logits,
+@@ -599,7 +614,7 @@ def sparse_attn_indexer(
+                 decode_metadata.schedule_metadata,
+                 max_model_len,
+             )
+-        else:
++        elif use_deep_gemm:
+             logits = fp8_fp4_paged_mqa_logits(
+                 (padded_q_quant_cast, padded_q_scale),
+                 kv_cache,
+@@ -611,6 +626,16 @@ def sparse_attn_indexer(
+                 clean_logits=False,
+                 indices=decode_metadata.indices,
+             )
++        else:
++            logits = fp8_paged_mqa_logits_triton(
++                padded_q_quant_cast,
++                kv_cache,
++                weights[:num_padded_tokens],
++                seq_lens,
++                decode_metadata.block_table,
++                max_model_len=attn_metadata_narrowed.max_seq_len,
++                clean_logits=False,
++            )
+         num_rows = logits.shape[0]
+         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+ 
+@@ -748,6 +773,7 @@ class SparseAttnIndexer(CustomOp):
+         max_model_len: int,
+         max_total_seq_len: int,
+         topk_indices_buffer: torch.Tensor,
++        num_heads: int,
+         skip_k_cache_insert: bool = False,
+         use_fp4_cache: bool = False,
+     ):
+@@ -771,12 +797,31 @@ class SparseAttnIndexer(CustomOp):
+         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+-        if current_platform.is_cuda() and not has_deep_gemm():
+-            raise RuntimeError(
+-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
+-                "the current vLLM environment."
++        if current_platform.is_cuda() and not is_deep_gemm_supported():
++            logger.warning_once(
++                "DeepGEMM not supported on this platform; using Triton "
++                "fallback for sparse attention indexer."
++            )
++            # Autotuning synchronizes, so prime both fallback kernels before
++            # memory profiling starts cudagraph capture.
++            from vllm.v1.attention.ops.mqa_logits_triton import (
++                warmup_fp8_mqa_logits_triton,
++                warmup_fp8_paged_mqa_logits_triton,
+             )
+ 
++            if not use_fp4_cache:
++                device = topk_indices_buffer.device
++                warmup_fp8_mqa_logits_triton(num_heads, head_dim, device)
++                block_sizes = {
++                    64,
++                    256,
++                    get_current_vllm_config().cache_config.block_size,
++                }
++                for kernel_block_size in sorted(block_sizes):
++                    warmup_fp8_paged_mqa_logits_triton(
++                        num_heads, head_dim, kernel_block_size, device
++                    )
++
+     def forward_native(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index 81e941d284..e97379474c 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -702,12 +702,17 @@ class Indexer(nn.Module):
+             self.max_model_len,
+             self.max_total_seq_len,
+             self.topk_indices_buffer,
++            num_heads=self.n_head,
+         )
+ 
+         self.is_inplace_rope = is_inplace_rope
+         self.n_head_scale = self.n_head**-0.5
+         self.use_fused_indexer_q = (
+             current_platform.is_cuda()
++            # The fused Triton kernel stores fp8e4nv, which Triton only
++            # supports on SM89+; older archs (e.g. SM80) take the unfused
++            # rope + per_token_group_quant_fp8 path below.
++            and current_platform.has_device_capability(89)
+             and self.quant_block_size == self.head_dim
+             and self.head_dim == 128
+             and self.rope_dim == 64
+diff --git a/vllm/model_executor/warmup/cutedsl_warmup.py b/vllm/model_executor/warmup/cutedsl_warmup.py
+index 3abd486e3c..59e25a9d8d 100644
+--- a/vllm/model_executor/warmup/cutedsl_warmup.py
++++ b/vllm/model_executor/warmup/cutedsl_warmup.py
+@@ -98,6 +98,9 @@ def cutedsl_warmup() -> None:
+     if not current_platform.is_cuda():
+         logger.debug("Skipping CuTeDSL warmup on non-CUDA platform.")
+         return
++    if not current_platform.has_device_capability(90):
++        logger.debug("Skipping CuTeDSL warmup on pre-Hopper CUDA device.")
++        return
+ 
+     compile_units = _collect_unique_compile_units(_iter_cutedsl_warmup_compile_units())
+     if not compile_units:
+diff --git a/vllm/model_executor/warmup/sparse_mla_triton_warmup.py b/vllm/model_executor/warmup/sparse_mla_triton_warmup.py
+index cf35bf40e8..0a5b967510 100644
+--- a/vllm/model_executor/warmup/sparse_mla_triton_warmup.py
++++ b/vllm/model_executor/warmup/sparse_mla_triton_warmup.py
+@@ -18,6 +18,7 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
+         "FLASHMLA_SPARSE_DSV4",
+         "FLASHINFER_MLA_SPARSE_DSV4",
+         "ROCM_FLASHMLA_SPARSE_DSV4",
++        "TRITON_MLA_SPARSE_DSV4",
+         "DEEPSEEK_SPARSE_SWA",
+     }
+ )
+diff --git a/vllm/models/deepseek_v32/amd/rocm.py b/vllm/models/deepseek_v32/amd/rocm.py
+index 0297fc3538..fcc847e3ec 100644
+--- a/vllm/models/deepseek_v32/amd/rocm.py
++++ b/vllm/models/deepseek_v32/amd/rocm.py
+@@ -62,6 +62,7 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
+                 self.indexer.max_total_seq_len,
+                 topk_indices_buffer,
+                 skip_k_cache_insert=True,
++                num_heads=self.indexer.n_head,
+             )
+         self._fp8_kv = is_quantized_kv_cache(self.kv_cache_dtype)
+         self._fp8_kv_needs_view = self._fp8_kv and self.kv_cache_dtype != "fp8_ds_mla"
+diff --git a/vllm/models/deepseek_v32/attention.py b/vllm/models/deepseek_v32/attention.py
+index 87458316c0..d7df7e893b 100644
+--- a/vllm/models/deepseek_v32/attention.py
++++ b/vllm/models/deepseek_v32/attention.py
+@@ -104,6 +104,7 @@ class DeepseekV32Indexer(nn.Module):
+             self.max_model_len,
+             self.max_total_seq_len,
+             self.topk_indices_buffer,
++            num_heads=self.n_head,
+         )
+ 
+     def forward(
+diff --git a/vllm/models/deepseek_v4/amd/rocm.py b/vllm/models/deepseek_v4/amd/rocm.py
+index 5e7609bd11..7e651b5cc0 100644
+--- a/vllm/models/deepseek_v4/amd/rocm.py
++++ b/vllm/models/deepseek_v4/amd/rocm.py
+@@ -405,6 +405,12 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
+     # also refreshes the ROCm-specific ragged SWA indices and indptrs.
+     supports_draft_decode_metadata_update = False
+ 
++    def build_tile_scheduler(self, num_decode_tokens: int):
++        # Ragged Triton decode never calls FlashMLA. Reuse the base builder's
++        # no-decode result to preserve its complete layer-type key set while
++        # skipping FlashMLA scheduler planning on ROCm and CUDA SM8x.
++        return super().build_tile_scheduler(0)
++
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+diff --git a/vllm/models/deepseek_v4/ampere/__init__.py b/vllm/models/deepseek_v4/ampere/__init__.py
+new file mode 100644
+index 0000000000..208f01a7cb
+--- /dev/null
++++ b/vllm/models/deepseek_v4/ampere/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/models/deepseek_v4/ampere/ampere_sparse.py b/vllm/models/deepseek_v4/ampere/ampere_sparse.py
+new file mode 100644
+index 0000000000..f9806a3123
+--- /dev/null
++++ b/vllm/models/deepseek_v4/ampere/ampere_sparse.py
+@@ -0,0 +1,32 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4 sparse MLA attention for SM8x (Ampere: A100/A800).
++
++Reuses the ROCm Triton sparse-MLA implementation wholesale: its kernels,
++ragged metadata builders, and bf16 o_proj reference path are plain
++Triton/torch (the aiter-only preshuffle GEMMs self-disable off ROCm), and
++``vllm.v1.attention.ops.fp8_sm80`` supplies e4m3 encode/decode below SM89
++where Triton refuses native fp8 converts.
++"""
++
++from vllm.models.deepseek_v4.amd.rocm import (
++    DeepseekV4ROCMAiterMLAAttention,
++    DeepseekV4ROCMAiterMLASparseBackend,
++)
++from vllm.platforms.interface import DeviceCapability
++
++
++class DeepseekV4AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
++    @staticmethod
++    def get_name() -> str:
++        return "TRITON_MLA_SPARSE_DSV4"
++
++    @classmethod
++    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        return capability.major == 8
++
++
++class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
++    """SM8x DeepSeek V4 attention: ROCm Triton path on CUDA Ampere."""
++
++    backend_cls = DeepseekV4AmpereMLASparseBackend
+diff --git a/vllm/models/deepseek_v4/attention.py b/vllm/models/deepseek_v4/attention.py
+index 128debf70c..7245b614da 100644
+--- a/vllm/models/deepseek_v4/attention.py
++++ b/vllm/models/deepseek_v4/attention.py
+@@ -881,6 +881,7 @@ class DeepseekV4Indexer(nn.Module):
+             self.max_model_len,
+             self.max_total_seq_len,
+             self.topk_indices_buffer,
++            num_heads=self.n_head,
+             skip_k_cache_insert=True,
+             use_fp4_cache=self.use_fp4_kv,
+         )
+diff --git a/vllm/models/deepseek_v4/common/ops/cache_utils.py b/vllm/models/deepseek_v4/common/ops/cache_utils.py
+index 1f53c96e93..fc731736da 100644
+--- a/vllm/models/deepseek_v4/common/ops/cache_utils.py
++++ b/vllm/models/deepseek_v4/common/ops/cache_utils.py
+@@ -29,8 +29,9 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+ )
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+-from vllm.utils.import_utils import has_cutedsl
++from vllm.utils.import_utils import is_cutedsl_supported
+ from vllm.utils.math_utils import next_power_of_2
++from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
+ 
+ 
+ @triton.jit
+@@ -129,12 +130,8 @@ def quantize_and_insert_k_kernel(
+             x_scaled = x / scale
+             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
+ 
+-            # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
+-            if use_fnuz:
+-                x_fp8 = x_clamped.to(tl.float8e4b8)
+-            else:
+-                x_fp8 = x_clamped.to(tl.float8e4nv)
+-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
++            # Convert to fp8 (FNUZ on gfx942, OCP elsewhere) as raw bytes.
++            x_uint8 = _encode_fp8_u8(x_clamped, use_fnuz)
+ 
+             # Store as uint8 (1 byte each)
+             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
+@@ -305,14 +302,8 @@ def _dequantize_and_gather_k_kernel(
+                 # Load quantized fp8 values (stored as uint8)
+                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+ 
+-                # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
+-                if use_fnuz:
+-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-                else:
+-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+-
+-                # Convert fp8 to float32 for computation
+-                x_float = x_fp8.to(tl.float32)
++                # Decode raw FP8 bytes without requiring native SM89 casts.
++                x_float = _decode_fp8_f32(x_uint8, use_fnuz)
+ 
+                 # Load and decode UE8M0 scale
+                 # UE8M0: scale = 2^(stored_value - 127)
+@@ -409,7 +400,7 @@ def dequantize_and_gather_k_cache(
+     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
+     writes FNUZ on gfx942 and OCP on gfx950).
+     """
+-    if has_cutedsl():
++    if is_cutedsl_supported():
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
+             dequantize_and_gather_k_cache_cutedsl,
+diff --git a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+index 4c9f464ef0..7cf214a5db 100644
+--- a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
++++ b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+@@ -26,6 +26,7 @@ import torch
+ 
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
++from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
+ 
+ if current_platform.is_rocm():
+     from vllm.platforms.rocm import _ON_GFX950
+@@ -263,8 +264,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
+     inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
+     x_scaled = quant_2d * inv_scales_col
+     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+-    x_fp8 = x_clamped.to(tl.float8e4nv)
+-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
++    x_uint8 = _encode_e4m3fn_u8(x_clamped)
+     x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
+ 
+     nope_mask = block < NOPE_HEAD_DIM
+@@ -483,7 +483,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
+     x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
+     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+     x_uint8 = tl.reshape(
+-        x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
++        _encode_e4m3fn_u8(x_clamped),
+         (TRITON_BLOCK_SIZE,),
+     )
+     tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
+@@ -837,8 +837,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
+ 
+     x_scaled = result_bf16 * inv_scale
+     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+-    x_fp8 = x_clamped.to(tl.float8e4nv)
+-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
++    x_uint8 = _encode_e4m3fn_u8(x_clamped)
+ 
+     tl.store(fp8_ptr + block, x_uint8, mask=mask)
+ 
+diff --git a/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py b/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
+index 5aa0017407..67a6a86f9f 100644
+--- a/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
++++ b/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
+@@ -5,7 +5,8 @@ import torch
+ 
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+-from vllm.utils.import_utils import has_cutedsl
++from vllm.utils.import_utils import is_cutedsl_supported
++from vllm.v1.attention.ops.fp8_sm80 import _encode_fp8_u8
+ 
+ # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
+ MXFP4_BLOCK_SIZE = 32
+@@ -134,25 +135,24 @@ def _fused_indexer_q_rope_quant_kernel(
+     index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), FP8_MAX)
+     index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+ 
+-    # Store quantized values to index_q_fp8. FNUZ (e4m3fnuz) on gfx942, OCP
+-    # (e4m3fn) elsewhere -- matches the K cache.
+-    fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
++    # Store quantized values to index_q_fp8 as raw bytes. FNUZ (e4m3fnuz)
++    # on gfx942, OCP (e4m3fn) elsewhere -- matches the K cache.
+     fp8_base_ptr = (
+         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
+     )
+     if INDEX_Q_NOPE_DIM > 0:
+         tl.store(
+             fp8_base_ptr + nope_offset,
+-            tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
++            _encode_fp8_u8(tl.div_rn(x_nope, index_q_scale), USE_FNUZ),
+         )
+     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
+     tl.store(
+         fp8_rot_base + half_offset * 2,
+-        tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
++        _encode_fp8_u8(tl.div_rn(r_even, index_q_scale), USE_FNUZ),
+     )
+     tl.store(
+         fp8_rot_base + half_offset * 2 + 1,
+-        tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
++        _encode_fp8_u8(tl.div_rn(r_odd, index_q_scale), USE_FNUZ),
+     )
+ 
+     # FP8 weight-fold contract:
+@@ -364,7 +364,7 @@ def fused_indexer_q_rope_quant(
+             index_q_packed, index_q_scale, _ = output_buffers
+         assert index_q_packed.shape == packed_shape
+         assert index_q_scale.shape == scale_shape
+-        if has_cutedsl():
++        if is_cutedsl_supported():
+             # lazily import, otherwise some tests fail due to CUDA driver init failure.
+             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
+                 fused_indexer_q_rope_quant_mxfp4_cutedsl,
+@@ -437,7 +437,7 @@ def fused_indexer_q_rope_quant(
+     else:
+         index_q_fp8, _ = output_buffers
+         assert index_q_fp8.shape == index_q.shape
+-    if has_cutedsl():
++    if is_cutedsl_supported():
+         # lazily import, otherwise some tests fail due to CUDA driver init failure.
+         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
+             fused_indexer_q_rope_quant_fp8_cutedsl,
+@@ -473,7 +473,9 @@ def fused_indexer_q_rope_quant(
+             index_q_cos_sin_cache,
+             index_q_cos_sin_cache.stride(0),
+             index_q_cos_sin_cache.shape[-1] // 2,
+-            index_q_fp8,
++            # uint8 view: an fp8-typed pointer arg would make Triton reject
++            # the kernel below SM89; the kernel stores raw encoded bytes.
++            index_q_fp8.view(torch.uint8),
+             index_q_fp8.stride(0),
+             index_q_fp8.stride(1),
+             index_q_head_dim,
+diff --git a/vllm/models/deepseek_v4/compressor.py b/vllm/models/deepseek_v4/compressor.py
+index 93ae1e89c9..8873779893 100644
+--- a/vllm/models/deepseek_v4/compressor.py
++++ b/vllm/models/deepseek_v4/compressor.py
+@@ -21,6 +21,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
+     save_partial_states,
+ )
+ from vllm.platforms import current_platform
++from vllm.utils.import_utils import is_cutedsl_supported
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionCGSupport,
+@@ -419,14 +420,15 @@ class DeepseekCompressor(nn.Module):
+         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
+         # does not, so the two callables have different signatures.
+         compress_norm_rope_store_fn: Any
+-        if current_platform.is_cuda() and self.head_dim == 512:
++        if is_cutedsl_supported() and self.head_dim == 512:
+             from .nvidia.ops.sparse_attn_compress_cutedsl import (
+                 compress_norm_rope_store_cutedsl,
+             )
+ 
+-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
+-            # layout and the plain full-cache layout. The full-cache flags
+-            # are consumed only here.
++            # head=512 on SM90+ CUDA always uses cutedsl, for both the
++            # fp8_ds_mla layout and the plain full-cache layout. The
++            # full-cache flags are consumed only here. Pre-Hopper CUDA takes
++            # the Triton path below like AMD/XPU.
+             compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
+             extra_kwargs: dict[str, Any] = dict(
+                 store_full_kv=store_full_kv,
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index ed7ee11ce5..91d1410465 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -777,6 +777,25 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
+     """
+     backend = vllm_config.attention_config.backend
+     device_capability = current_platform.get_device_capability()
++    if device_capability is not None and device_capability.major == 8:
++        if (
++            backend is not None
++            and backend != AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4
++        ):
++            raise ValueError(
++                f"{backend.name} is not supported for DeepSeek V4 on SM8x; "
++                "use TRITON_MLA_SPARSE_DSV4 (default)."
++            )
++        if vllm_config.attention_config.use_fp4_indexer_cache:
++            raise ValueError(
++                "attention_config.use_fp4_indexer_cache requires SM100; "
++                "the MXFP4 indexer kernels emit Blackwell-only PTX."
++            )
++        from vllm.models.deepseek_v4.ampere.ampere_sparse import (
++            DeepseekV4AmpereMLAAttention,
++        )
++
++        return DeepseekV4AmpereMLAAttention
+     if backend in (
+         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+diff --git a/vllm/platforms/cuda.py b/vllm/platforms/cuda.py
+index bfe08a5772..c7d988c870 100644
+--- a/vllm/platforms/cuda.py
++++ b/vllm/platforms/cuda.py
+@@ -130,7 +130,11 @@ def _get_backend_priorities(
+         elif device_capability.major == 12:
+             return [
+                 AttentionBackendEnum.TRITON_MLA,
++                # FP8 KV cache only; with BF16 KV it is rejected by
++                # supports_combination and selection falls through to the
++                # Triton sparse backend below.
+                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
++                AttentionBackendEnum.TRITON_MLA_SPARSE,
+             ]
+         else:
+             return [
+@@ -140,6 +144,7 @@ def _get_backend_priorities(
+                 AttentionBackendEnum.TRITON_MLA,
+                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
+                 AttentionBackendEnum.FLASHMLA_SPARSE,
++                AttentionBackendEnum.TRITON_MLA_SPARSE,
+             ]
+     else:
+         # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
+diff --git a/vllm/utils/import_utils.py b/vllm/utils/import_utils.py
+index 03e301317f..2d373be935 100644
+--- a/vllm/utils/import_utils.py
++++ b/vllm/utils/import_utils.py
+@@ -580,6 +580,19 @@ def has_cutedsl() -> bool:
+     return _has_module("cutlass")
+ 
+ 
++@cache
++def is_cutedsl_supported() -> bool:
++    """Whether CuTe DSL is installed *and* can compile for this device.
++
++    Mirrors ``is_deep_gemm_supported()``: the kernels target SM90+, and
++    compiling them for an older arch aborts the process, so package
++    presence alone (``has_cutedsl()``) is not a usable dispatch gate.
++    """
++    from vllm.platforms import current_platform
++
++    return has_cutedsl() and current_platform.has_device_capability(90)
++
++
+ def has_humming() -> bool:
+     """Whether the optional `humming` package is available."""
+     return _has_module("humming")
+diff --git a/vllm/v1/attention/backends/mla/sparse_swa.py b/vllm/v1/attention/backends/mla/sparse_swa.py
+index d858eb677c..47b38ee2df 100644
+--- a/vllm/v1/attention/backends/mla/sparse_swa.py
++++ b/vllm/v1/attention/backends/mla/sparse_swa.py
+@@ -133,7 +133,12 @@ class DeepseekSparseSWABackend(AttentionBackend):
+ 
+     @staticmethod
+     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
+-        if current_platform.is_rocm():
++        # ROCm and CUDA SM8x share the ragged Triton decode kernels, which
++        # consume the ragged SWA metadata this builder adds.
++        if current_platform.is_rocm() or (
++            current_platform.is_cuda()
++            and not current_platform.has_device_capability(90)
++        ):
+             from vllm.models.deepseek_v4.amd.rocm import (
+                 DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
+             )
+diff --git a/vllm/v1/attention/backends/mla/triton_mla_sparse.py b/vllm/v1/attention/backends/mla/triton_mla_sparse.py
+new file mode 100644
+index 0000000000..e1cfe773a6
+--- /dev/null
++++ b/vllm/v1/attention/backends/mla/triton_mla_sparse.py
+@@ -0,0 +1,110 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Pure-Triton sparse MLA backend for SM80 (A100) / SM121 (GB10)."""
++
++from typing import ClassVar
++
++import torch
++
++from vllm.utils.platform_utils import num_compute_units
++from vllm.v1.attention.backend import (
++    AttentionCGSupport,
++    MultipleOf,
++)
++from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
++    XPUMLASparseBackend,
++    XPUMLASparseImpl,
++    XPUMLASparseMetadata,
++    XPUMLASparseMetadataBuilder,
++)
++from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
++    _DIM_QK,
++    KV_SPLITS_CANDIDATES,
++    triton_mla_sparse_attention,
++)
++
++
++class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
++    # XPU base keeps NEVER (not validated under cudagraph); this subclass
++    # claims UNIFORM_BATCH for the CUDA/Triton path.
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++
++class TritonMLASparseImpl(XPUMLASparseImpl):
++    """Triton sparse-MLA impl with split-KV decode (3-7× faster than the
++    single-pass XPU base for single-query decode on SM80 / SM121)."""
++
++    def __init__(self, *args, **kwargs) -> None:
++        super().__init__(*args, **kwargs)
++        self._sm_count: int | None = None
++        if self.topk_indices_buffer is not None:
++            self._sm_count = num_compute_units(self.topk_indices_buffer.device.index)
++        self._warmup_autotune()
++
++    def _warmup_autotune(self) -> None:
++        """Prime `@triton.autotune` caches at init so the first request
++        doesn't pay the inline config-sweep cost."""
++        if self.topk_indices_buffer is None:
++            return
++        device = self.topk_indices_buffer.device
++        topk = self.topk_indices_buffer.shape[-1]
++        q = torch.empty(1, self.num_heads, _DIM_QK, dtype=torch.bfloat16, device=device)
++        kv = torch.empty(64, 1, _DIM_QK, dtype=torch.bfloat16, device=device)
++        indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)
++        for splits in KV_SPLITS_CANDIDATES:
++            triton_mla_sparse_attention(
++                q,
++                kv,
++                indices,
++                sm_scale=self.softmax_scale,
++                num_kv_splits=splits,
++                sm_count=self._sm_count,
++            )
++
++    def _forward_bf16_kv(
++        self,
++        q: torch.Tensor,  # [sq, heads, d_qk]
++        kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk]
++        topk_indices: torch.Tensor,  # [sq, topk]
++        attn_metadata: XPUMLASparseMetadata,
++    ) -> torch.Tensor:
++        num_tokens = q.shape[0]
++        kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
++            -1, 1, kv_c_and_k_pe_cache.shape[-1]
++        )
++        topk_indices = topk_indices.view(num_tokens, 1, -1)
++        output = triton_mla_sparse_attention(
++            q,
++            kv_c_and_k_pe_cache,
++            topk_indices,
++            sm_scale=self.softmax_scale,
++            sm_count=self._sm_count,
++        )
++        return output
++
++
++class TritonMLASparseBackend(XPUMLASparseBackend):
++    """Same bf16 sparse-MLA contract as the XPU backend, CUDA Triton kernels."""
++
++    @staticmethod
++    def get_name() -> str:
++        return "TRITON_MLA_SPARSE"
++
++    @staticmethod
++    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
++        # The DSA indexer backend requires block size 64 on CUDA and shares
++        # the KV cache group with this backend; the base-class MultipleOf(1)
++        # default lets auto-selection settle on 16, which then fails
++        # select_common_block_size ("No common block size for 16").
++        # MultipleOf(64) (rather than [64]) keeps larger user-specified
++        # sizes like 128 usable, which measurably lowers profile-time peak
++        # memory for very long contexts.
++        return [MultipleOf(64)]
++
++    @staticmethod
++    def get_builder_cls() -> type["TritonMLASparseMetadataBuilder"]:
++        return TritonMLASparseMetadataBuilder
++
++    @staticmethod
++    def get_impl_cls() -> type["TritonMLASparseImpl"]:
++        return TritonMLASparseImpl
+diff --git a/vllm/v1/attention/backends/registry.py b/vllm/v1/attention/backends/registry.py
+index 646227cc4f..cb3994850f 100644
+--- a/vllm/v1/attention/backends/registry.py
++++ b/vllm/v1/attention/backends/registry.py
+@@ -78,6 +78,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
+         "FlashInferMLASparseSM120Backend"
+     )
+     TRITON_MLA = "vllm.v1.attention.backends.mla.triton_mla.TritonMLABackend"
++    TRITON_MLA_SPARSE = (
++        "vllm.v1.attention.backends.mla.triton_mla_sparse.TritonMLASparseBackend"
++    )
+     CUTLASS_MLA = "vllm.v1.attention.backends.mla.cutlass_mla.CutlassMLABackend"
+     FLASHMLA = "vllm.v1.attention.backends.mla.flashmla.FlashMLABackend"
+     FLASHMLA_SPARSE = (
+@@ -94,6 +97,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
+     ROCM_FLASHMLA_SPARSE_DSV4 = (
+         "vllm.models.deepseek_v4.amd.rocm.DeepseekV4ROCMAiterMLASparseBackend"
+     )
++    TRITON_MLA_SPARSE_DSV4 = (
++        "vllm.models.deepseek_v4.ampere.ampere_sparse.DeepseekV4AmpereMLASparseBackend"
++    )
+     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
+     FLASH_ATTN_MLA_SPARSE = (
+         "vllm.v1.attention.backends.mla.flashattn_mla_sparse.FlashAttnMLASparseBackend"
+diff --git a/vllm/v1/attention/ops/fp8_sm80.py b/vllm/v1/attention/ops/fp8_sm80.py
+new file mode 100644
+index 0000000000..0c4f894ba1
+--- /dev/null
++++ b/vllm/v1/attention/ops/fp8_sm80.py
+@@ -0,0 +1,173 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""fp8 e4m3fn encode/decode for Triton kernels on pre-SM89 CUDA.
++
++Triton refuses every conversion between ``fp8e4nv`` and other float types
++below SM89 (``bitcast`` is allowed), so these substitute:
++
++- store side: a manual round-to-nearest-even saturating encoder on the fp32
++  bit pattern, bit-exact with ``x.to(tl.float8e4nv)`` /
++  ``torch.Tensor.to(torch.float8_e4m3fn)`` (satfinite semantics).
++- load side: a 256-entry bf16 lookup table. Measured 1.35-1.48x faster than
++  an ALU unpack in the sparse-MLA decode kernels -- the table stays in L1
++  while the ALU version's live values spill (68 spills vs 6), so prefer it
++  wherever a kernel can accept the extra pointer argument.
++
++``USE_FNUZ`` branches stay on the hardware convert: FNUZ only occurs on
++gfx942, which has it.
++"""
++
++import torch
++
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++
++
++def native_fp8_cast_supported() -> bool:
++    """Whether Triton may emit native fp8e4nv converts on this device.
++
++    Only CUDA below SM89 lacks the convert; other Triton backends
++    (XPU/ROCm) keep their native paths.
++    """
++    if not current_platform.is_cuda():
++        return True
++    return current_platform.supports_fp8()
++
++
++# Frozen into Triton kernels at first compile (globals referenced inside
++# @triton.jit are compile-time constants), so SM89+ keeps the hardware
++# convert and SM80 transparently gets the software path with no launcher
++# plumbing. Defaults to the software path: it is bit-exact everywhere, just
++# slower, so a failed probe degrades performance rather than compilation.
++try:
++    _NATIVE_FP8_CAST = tl.constexpr(native_fp8_cast_supported())
++except Exception:
++    _NATIVE_FP8_CAST = tl.constexpr(False)
++
++
++_E4M3FN_BF16_LUT_CACHE: dict[tuple[torch.device, float | None], torch.Tensor] = {}
++
++
++def get_e4m3fn_bf16_lut(
++    device: torch.device, nan_value: float | None = None
++) -> torch.Tensor:
++    """256-entry e4m3fn -> bf16 decode table.
++
++    ``nan_value`` replaces the two NaN encodings (0x7F/0xFF, signed): pass
++    a finite magnitude where NaN would poison a downstream reduction (the
++    indexer's dot product uses +-480), or leave it None for kernels that
++    scrub NaN themselves and need NaN in, NaN out.
++    """
++    key = (device, nan_value)
++    lut = _E4M3FN_BF16_LUT_CACHE.get(key)
++    if lut is None:
++        lut = (
++            torch.arange(256, dtype=torch.uint8, device=device)
++            .view(torch.float8_e4m3fn)
++            .to(torch.bfloat16)
++        )
++        if nan_value is not None:
++            lut[0x7F] = nan_value
++            lut[0xFF] = -nan_value
++        _E4M3FN_BF16_LUT_CACHE[key] = lut
++    return lut
++
++
++@triton.jit
++def _f32_to_e4m3fn_u8(x):
++    """fp32 -> e4m3fn byte: RNE, saturating to +-448, NaN -> 0x7F | sign.
++
++    Unified integer rounding: the f32 mantissa (implicit bit materialized)
++    is shifted so the kept bits land at the e4m3 granularity; the same
++    add-carry then handles mantissa-overflow into the exponent and
++    subnormal -> min-normal promotion.
++    """
++    fbits = x.to(tl.float32).to(tl.uint32, bitcast=True)
++    sign8 = ((fbits >> 24) & 0x80).to(tl.uint8)
++    mag = fbits & 0x7FFFFFFF
++
++    is_nan = mag > 0x7F800000
++
++    exp = (mag >> 23).to(tl.int32) - 127
++    mant = (mag & 0x7FFFFF) | 0x800000
++
++    # Normal e4m3 target keeps 3 mantissa bits -> drop 20; subnormal
++    # targets (exp < -6) drop progressively more. The cap keeps the shift in
++    # range for f32 subnormals and zero, which give exp <= -126; every value
++    # reaching it has rest < half, so it still rounds to zero.
++    shift = tl.minimum(20 + tl.maximum(-6 - exp, 0), 30)
++    keep = (mant >> shift).to(tl.uint32)
++    rest = mant & ((1 << shift) - 1)
++    half = (1 << (shift - 1)).to(tl.uint32)
++    round_up = (rest > half) | ((rest == half) & ((keep & 1) == 1))
++    keep = keep + round_up.to(tl.uint32)
++
++    # keep carries the implicit bit for normals: val = ((E-1)<<3) + keep.
++    val_normal = (((exp + 6) << 3).to(tl.uint32) + keep).to(tl.uint32)
++    val = tl.where(exp >= -6, val_normal, keep)
++    # satfinite: every overflow (incl. inf and mantissa-carry past 448)
++    # lands above 0x7E and clamps to the max finite.
++    val = tl.minimum(val, 0x7E)
++    val = tl.where(is_nan, 0x7F, val)
++    return (val.to(tl.uint8) | sign8).to(tl.uint8)
++
++
++@triton.jit
++def _encode_e4m3fn_u8(x):
++    """Drop-in for ``x.to(tl.float8e4nv).to(tl.uint8, bitcast=True)``."""
++    if _NATIVE_FP8_CAST:
++        return x.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
++    else:
++        return _f32_to_e4m3fn_u8(x)
++
++
++@triton.jit
++def _encode_fp8_u8(x, USE_FNUZ: tl.constexpr):
++    """FNUZ-aware byte encode: e4m3fnuz on gfx942, e4m3fn elsewhere."""
++    if USE_FNUZ:
++        return x.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
++    else:
++        return _encode_e4m3fn_u8(x)
++
++
++@triton.jit
++def _e4m3fn_to_f32_alu(u):
++    """e4m3fn byte -> exact f32 via integer math, NaN preserved.
++
++    For kernels that cannot take a LUT pointer; prefer ``_decode_fp8_lut``.
++    """
++    u32 = u.to(tl.uint32)
++    sign = tl.where((u32 & 0x80) != 0, -1.0, 1.0)
++    exp = ((u32 >> 3) & 0xF).to(tl.float32)
++    mant = (u32 & 0x7).to(tl.float32)
++    is_normal = exp > 0.0
++    m = tl.where(is_normal, mant + 8.0, mant)
++    e = tl.where(is_normal, exp, 1.0) - 10.0
++    val = sign * m * tl.exp2(e)
++    return tl.where((u32 & 0x7F) == 0x7F, float("nan"), val)
++
++
++@triton.jit
++def _decode_fp8_f32(u, USE_FNUZ: tl.constexpr):
++    """FNUZ-aware byte decode to f32, without a LUT."""
++    if USE_FNUZ:
++        return u.to(tl.float8e4b8, bitcast=True).to(tl.float32)
++    elif _NATIVE_FP8_CAST:
++        return u.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    else:
++        return _e4m3fn_to_f32_alu(u)
++
++
++@triton.jit
++def _decode_fp8_lut(u, USE_FNUZ: tl.constexpr, lut_ptr):
++    """FNUZ-aware byte decode; pre-SM89 CUDA reads ``lut_ptr``.
++
++    ``lut_ptr`` must come from :func:`get_e4m3fn_bf16_lut` and is
++    ignored (compile-time) wherever the hardware convert exists.
++    """
++    if USE_FNUZ:
++        return u.to(tl.float8e4b8, bitcast=True).to(tl.float32)
++    elif _NATIVE_FP8_CAST:
++        return u.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    else:
++        return tl.load(lut_ptr + u.to(tl.uint32))
+diff --git a/vllm/v1/attention/ops/mqa_logits_triton.py b/vllm/v1/attention/ops/mqa_logits_triton.py
+new file mode 100644
+index 0000000000..1221e1601e
+--- /dev/null
++++ b/vllm/v1/attention/ops/mqa_logits_triton.py
+@@ -0,0 +1,645 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Triton fallback for DeepGEMM's fp8_mqa_logits / fp8_paged_mqa_logits."""
++
++import functools
++
++import torch
++
++from vllm import envs
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++from vllm.utils.platform_utils import num_compute_units
++from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
++
++_IS_SM80 = current_platform.is_cuda() and current_platform.get_device_capability() == (
++    8,
++    0,
++)
++
++# Paged decode: num_warps=4 dominated on A100/SM80 across {2,4,8}; the others
++# were 1.5–1.7× slower at (num_heads=32, head_dim=128, block_size=64), so
++# narrow the sweep to keep autotune from latching onto a bad pick under noise.
++#
++# Deliberately NOT carrying the `maxnreg=128` cap the prefill configs below do,
++# measured on A100 at H=64 D=128 block_size=64 (benchmark_dsv4_sm80.py
++# --kernel indexer-paged). Unconstrained the decode kernel takes 136 regs =
++# 3 CTAs/SM; the cap reaches 4 CTAs/SM at 2 B of spill, and that trades one
++# regime against another rather than winning outright:
++#
++#   CTAs (B x blocks)  |  15    64   209   418   3344   13376
++#   vs uncapped        | +2.4% +1.7% +1.6% -3.7%  -3.4%  -3.5%
++#
++# The sign follows wave quantization, not latency hiding: 108 SMs hold 324
++# concurrent CTAs at 3/SM and 432 at 4/SM, so the cap only pays past ~1.3
++# waves (n_compressed >~ 20.7k at batch 1, i.e. >~83k context, or any batched
++# decode), and below that the spill and the lost ILP cost ~2%. At the 107k
++# batch-1 point that is 0.43 us on a 21-calls-per-step kernel = 0.009 ms/step
++# against a ~10.9 ms step, so the win is not worth the mid-context loss. The
++# autotune key carries no context length, so the choice cannot be made per
++# call site without dropping @triton.autotune here.
++_PAGED_AUTOTUNE_CONFIGS = [
++    triton.Config({}, num_warps=4, num_stages=ns) for ns in (2, 4)
++]
++
++# Prefill: BLOCK_N=128 with num_warps=4 measured fastest at every shape
++# swept (M 1..2048, N 2048..131072) -- BN=64 is 1.25-1.40x worse, BN=32 up to
++# 2.41x. The autotune key is (num_heads, head_dim), both fixed for a model,
++# so a wider sweep cannot adapt per request; it only adds cold-cache JIT.
++#
++# maxnreg lives in VLLM_INDEXER_LOGITS_MAXNREG (0 = unconstrained, the
++# default). It used to be pinned at 128 on the reading that the kernel took
++# 132 regs, so 128 bought a 4th CTA/SM "with no spill regression", measured
++# 7.7-8.5% faster over (M 8..2048, N 8192..28672) at KV_GROUP=1.
++#
++# That measurement has expired (rule 47): this kernel now takes 162 regs, so
++# 128 is no longer a boundary but a 34-register cut, and it spills 6 B
++# unfactored / 14 B with FACTOR_K_SCALE. Re-measured on this tree, the cap is
++# neutral-to-worse everywhere and costs 4.0% at the shape serving actually
++# runs:
++#
++#   (M, N, G)      | (8, 8k, 1) (240, 8k, 1) (2048, 8k, 1) (240, 61440, 8)
++#   cap 128 vs off |     +6.7%       -0.0%         +1.2%          +4.0%
++#
++# Sixth confirmation of canon S8: every perturbation that raises resident
++# parallelism on this kernel family costs it more than the occupancy buys.
++_PREFILL_AUTOTUNE_CONFIGS = [
++    triton.Config(
++        {"BLOCK_N": 128},
++        num_warps=4,
++        num_stages=ns,
++        maxnreg=None,
++    )
++    for ns in (2, 4)
++]
++
++# KV_GROUP is selected by the wrapper from M and N, not autotuned: grouping 8
++# tiles per CTA reuses the q/weights load 8x and measures 3.9% faster at the
++# 128k prefill shape (7.11 -> 6.84 ms at M=2048, N=28672; G=16 turns back up),
++# but only large SM80 prefill grids select it; smaller grids, short contexts,
++# and other fallback devices keep the original ungrouped specialization.
++#
++# The gate used to be `m >= 512`, tuned at M=2048. Query sharding plus the
++# logits budget's sub-chunking made the production call M=240, so the
++# specialization the warmup path pre-compiles never once ran in serving
++# (rule 47). M alone is also the wrong variable: grouping divides the grid's
++# N dimension by KV_GROUP, so what decides it is whether the GROUPED grid
++# still fills the machine. Measured at maxnreg unconstrained, N >= 16384:
++#
++#   M x grid_y (grouped CTAs) |    128    480    512  14400
++#   grouped vs ungrouped      | +24.8%  -7.5%  -9.2%  -9.9%
++#
++# The sign flips at one wave (108 SMs x 3 CTAs/SM at 162 regs = 324), which
++# is what `_kv_group_min_ctas` computes -- and it gets all four corners right
++# where any single M threshold gets at most three.
++_KV_GROUP = 8
++_KV_GROUP_MIN_N = 16384
++_KV_GROUP_CTAS_PER_SM = 3
++_PREFILL_BLOCK_N = 128
++
++# Warmup shape mirrors the chunked-prefill regime (small M, long N) so
++# autotune picks a tile sized for real serving rather than a launch-overhead-
++# dominated dummy grid.
++_PREFILL_WARMUP_M = 8
++_PREFILL_WARMUP_N = 8192
++
++
++# NaN bytes pin to +-480 so a NaN cache entry cannot poison the whole
++# logits row through the dot product.
++_INDEXER_LUT_NAN_VALUE = 480.0
++
++
++def _get_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
++    return get_e4m3fn_bf16_lut(device, nan_value=_INDEXER_LUT_NAN_VALUE)
++
++
++@triton.jit
++def _decode_e4m3fn_bf16_lut(u, lut_ptr):
++    return tl.load(lut_ptr + u.to(tl.uint32))
++
++
++@triton.autotune(
++    configs=_PAGED_AUTOTUNE_CONFIGS,
++    key=["num_heads", "head_dim", "block_size"],
++)
++@triton.jit
++def _fp8_paged_mqa_logits_kernel(
++    q_ptr,
++    kv_fp8_ptr,
++    kv_scale_ptr,
++    weights_ptr,
++    fp8_lut_ptr,
++    context_lens_ptr,
++    block_tables_ptr,
++    logits_ptr,
++    stride_q_b,
++    stride_q_n,
++    stride_q_h,
++    stride_q_d,
++    stride_kvf_block,
++    stride_kvf_s,
++    stride_kvf_d,
++    stride_kvs_block,
++    stride_kvs_s,
++    stride_w_t,
++    stride_w_h,
++    stride_bt_b,
++    stride_bt_k,
++    stride_l_t,
++    stride_l_n,
++    next_n: tl.constexpr,
++    num_heads: tl.constexpr,
++    head_dim: tl.constexpr,
++    block_size: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    Q_IS_BF16: tl.constexpr,
++):
++    token_id = tl.program_id(0)
++    block_rk = tl.program_id(1)
++
++    batch_id = token_id // next_n
++    next_n_id = token_id % next_n
++
++    context_len = tl.load(context_lens_ptr + batch_id)
++    if block_rk * block_size >= context_len:
++        return
++
++    q_offset = context_len - next_n + next_n_id
++
++    # int64: unified-KV-pool layer views carry a large block stride (~1e6
++    # elements), so int32 `block_idx * stride` wraps once a batch touches
++    # roughly >2k pool blocks (long context or concurrent sequences).
++    block_idx = tl.load(
++        block_tables_ptr + batch_id * stride_bt_b + block_rk * stride_bt_k
++    ).to(tl.int64)
++
++    offs_h = tl.arange(0, BLOCK_H)
++    offs_d = tl.arange(0, BLOCK_D)
++    offs_n = tl.arange(0, BLOCK_N)
++    mask_h = offs_h < num_heads
++    mask_d = offs_d < head_dim
++    mask_n = offs_n < block_size
++
++    # Q_IS_BF16: q arrives already decoded. The grid is
++    # (B*next_n, num_block_cols), so an in-kernel LUT decode of q re-runs once
++    # per KV block though q is identical across `block_rk` -- exactly half of
++    # the kernel's 16k per-lane gathers, feeding one tl.dot. The wrapper
++    # applies the same 256-entry table once instead. k keeps the LUT: it
++    # differs per block, and reading it as fp8 is 6.8x worse (canon S1).
++    q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
++    q_offs = offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d
++    q_mask = mask_h[:, None] & mask_d[None, :]
++    if Q_IS_BF16:
++        q = tl.load(q_base + q_offs, mask=q_mask, other=0.0)
++    else:
++        q = _decode_e4m3fn_bf16_lut(
++            tl.load(q_base + q_offs, mask=q_mask, other=0), fp8_lut_ptr
++        )
++
++    kvf_base = kv_fp8_ptr + block_idx * stride_kvf_block
++    k_byte = tl.load(
++        kvf_base + offs_n[:, None] * stride_kvf_s + offs_d[None, :] * stride_kvf_d,
++        mask=mask_n[:, None] & mask_d[None, :],
++        other=0,
++    )
++    kvs_base = kv_scale_ptr + block_idx * stride_kvs_block
++    k_scale = tl.load(
++        kvs_base + offs_n * stride_kvs_s,
++        mask=mask_n,
++        other=0.0,
++    )
++    k = _decode_e4m3fn_bf16_lut(k_byte, fp8_lut_ptr)
++    # Scale in fp32 after the dot to avoid an extra bf16 round-trip on K.
++    s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
++
++    w = tl.load(
++        weights_ptr + token_id * stride_w_t + offs_h * stride_w_h,
++        mask=mask_h,
++        other=0.0,
++    )
++    s = tl.where(s > 0, s, 0.0) * w[:, None]
++    out = tl.sum(s, axis=0)
++
++    k_offset = block_rk * block_size + offs_n
++    # Store mask below covers mask_n and the context bound; -inf only has to
++    # mask the causal tail inside the written region.
++    out = tl.where(k_offset <= q_offset, out, float("-inf"))
++
++    tl.store(
++        logits_ptr + token_id * stride_l_t + k_offset * stride_l_n,
++        out,
++        mask=mask_n & (k_offset < context_len),
++    )
++
++
++def fp8_paged_mqa_logits_triton(
++    q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    weights: torch.Tensor,
++    context_lens: torch.Tensor,
++    block_tables: torch.Tensor,
++    max_model_len: int,
++    clean_logits: bool = True,
++) -> torch.Tensor:
++    """Triton implementation of DeepGEMM's fp8_paged_mqa_logits.
++
++    Args:
++        q:             [B, next_n, H, D] fp8_e4m3fn
++        kv_cache:      [num_blocks, block_size, 1, D+4] uint8 (FP8 + fp32 scale)
++        weights:       [B*next_n, H] float32
++        context_lens:  [B] int32
++        block_tables:  [B, max_blocks] int32
++        max_model_len: output width. Caller passes the active batch max so
++            the logits buffer and grid stay tight.
++        clean_logits: when False, skip the -inf pre-fill of the output
++            (indexer top-k reads only `[:context_len]` per row).
++    Returns:
++        logits:        [B*next_n, max_model_len] float32
++    """
++    B, next_n, num_heads, head_dim = q.shape
++    _, block_size, one, d_plus_4 = kv_cache.shape
++    assert one == 1
++    assert d_plus_4 == head_dim + 4
++
++    # Cache layout from `indexer_k_quant_and_cache`: per block, FP8 K bytes
++    # (block_size * head_dim) followed by fp32 scales (block_size * 4). The
++    # `[NB, block_size, 1, head_dim+4]` shape is a stride trick; re-slice flat.
++    # Kernel decodes FP8 from uint8 via LUT (SM80 Triton can't load fp8e4nv).
++    num_blocks = kv_cache.shape[0]
++    kv_flat = kv_cache.view(num_blocks, -1)
++    k_end = block_size * head_dim
++    kv_byte = kv_flat[:, :k_end].as_strided(
++        (num_blocks, block_size, head_dim),
++        (kv_flat.stride(0), head_dim, 1),
++    )
++    kv_scale = kv_flat[:, k_end:].view(torch.float32)
++    q_byte = q.view(torch.uint8)
++    q_is_bf16 = False
++
++    if clean_logits:
++        logits = torch.full(
++            (B * next_n, max_model_len),
++            float("-inf"),
++            dtype=torch.float32,
++            device=q.device,
++        )
++    else:
++        logits = torch.empty(
++            (B * next_n, max_model_len), dtype=torch.float32, device=q.device
++        )
++
++    BLOCK_H = max(16, triton.next_power_of_2(num_heads))
++    BLOCK_D = triton.next_power_of_2(head_dim)
++    BLOCK_N = triton.next_power_of_2(block_size)
++
++    fp8_lut = _get_e4m3fn_bf16_lut(q.device)
++    if q_is_bf16:
++        # The same table the kernel would apply, applied once per call instead
++        # of once per (query, KV block). `lut[byte]` produces exactly what
++        # `_decode_e4m3fn_bf16_lut` produces -- NaN pin at +-480 included --
++        # so the operands reaching tl.dot are bit-identical.
++        q_in = fp8_lut.index_select(
++            0, q_byte.reshape(-1).to(torch.int32)
++        ).view(q_byte.shape)
++    else:
++        q_in = q_byte
++    # The block table is allocated at full max_model_len width and only
++    # narrowed along dim 0, so sizing the grid by it launches a CTA per
++    # possible block rather than per live one; each surplus CTA loads
++    # context_lens and returns. max_model_len here is the active batch max.
++    num_block_cols = min(block_tables.shape[1], triton.cdiv(max_model_len, block_size))
++    grid = (B * next_n, num_block_cols)
++    _fp8_paged_mqa_logits_kernel[grid](
++        q_in,
++        kv_byte,
++        kv_scale,
++        weights,
++        fp8_lut,
++        context_lens,
++        block_tables,
++        logits,
++        q_in.stride(0),
++        q_in.stride(1),
++        q_in.stride(2),
++        q_in.stride(3),
++        kv_byte.stride(0),
++        kv_byte.stride(1),
++        kv_byte.stride(2),
++        kv_scale.stride(0),
++        kv_scale.stride(1),
++        weights.stride(0),
++        weights.stride(1),
++        block_tables.stride(0),
++        block_tables.stride(1),
++        logits.stride(0),
++        logits.stride(1),
++        next_n=next_n,
++        num_heads=num_heads,
++        head_dim=head_dim,
++        block_size=block_size,
++        BLOCK_H=BLOCK_H,
++        BLOCK_D=BLOCK_D,
++        BLOCK_N=BLOCK_N,
++        Q_IS_BF16=q_is_bf16,
++    )
++    return logits
++
++
++@triton.autotune(
++    configs=_PREFILL_AUTOTUNE_CONFIGS,
++    # Per-program work is N-independent; key on (heads, dim) only so chunked
++    # prefill with varying N doesn't re-tune on every new chunk size.
++    key=["num_heads", "head_dim"],
++)
++@triton.jit
++def _fp8_mqa_logits_kernel(
++    q_ptr,
++    k_ptr,
++    k_scale_ptr,
++    weights_ptr,
++    ks_ptr,
++    ke_ptr,
++    logits_ptr,
++    stride_q_m,
++    stride_q_h,
++    stride_q_d,
++    stride_k_n,
++    stride_k_d,
++    stride_w_m,
++    stride_w_h,
++    stride_l_m,
++    stride_l_n,
++    num_heads: tl.constexpr,
++    head_dim: tl.constexpr,
++    N,
++    BLOCK_H: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    KV_GROUP: tl.constexpr,
++    FACTOR_K_SCALE: tl.constexpr,
++):
++    # bf16 q/k inputs: the wrapper pre-decodes FP8 → bf16. At compute-bound
++    # prefill this is ~2× the in-kernel LUT (LUT lookups contend with the
++    # matmul for ALU/regs). Paged-decode keeps the LUT path.
++    #
++    # Each CTA owns KV_GROUP consecutive BLOCK_N tiles for one query row, so
++    # the q tile and weights load once per KV_GROUP tiles instead of once per
++    # tile. gridY is huge at long context (N/BLOCK_N), so dividing it by
++    # KV_GROUP costs no occupancy.
++    m = tl.program_id(0)
++    group = tl.program_id(1)
++
++    group_start = group * (KV_GROUP * BLOCK_N)
++    ks = tl.load(ks_ptr + m)
++    ke = tl.load(ke_ptr + m)
++
++    # Early-exit when this row's `[ks, ke)` range doesn't overlap the whole
++    # group. Chunked prefill produces many such all-masked spans per row.
++    if (group_start >= ke) | (group_start + KV_GROUP * BLOCK_N <= ks):
++        # When `clean_logits=False` the caller skipped the -inf pre-fill, so
++        # write -inf here for the early-exit span.
++        offs_span = group_start + tl.arange(0, BLOCK_N)
++        for _ in tl.static_range(KV_GROUP):
++            tl.store(
++                logits_ptr + m * stride_l_m + offs_span * stride_l_n,
++                tl.full([BLOCK_N], float("-inf"), dtype=tl.float32),
++                mask=offs_span < N,
++            )
++            offs_span += BLOCK_N
++        return
++
++    offs_h = tl.arange(0, BLOCK_H)
++    offs_d = tl.arange(0, BLOCK_D)
++    mask_h = offs_h < num_heads
++    mask_d = offs_d < head_dim
++
++    q = tl.load(
++        q_ptr
++        + m * stride_q_m
++        + offs_h[:, None] * stride_q_h
++        + offs_d[None, :] * stride_q_d,
++        mask=mask_h[:, None] & mask_d[None, :],
++        other=0.0,
++    )
++    w = tl.load(
++        weights_ptr + m * stride_w_m + offs_h * stride_w_h,
++        mask=mask_h,
++        other=0.0,
++    )
++
++    # The per-tile liveness branch is kept even though the tl.where below
++    # would make a branch-free loop correct: without it Triton software-
++    # pipelines the k tiles across the unrolled iterations, and the extra
++    # live tiles blow the register budget (5x slower under maxnreg=128,
++    # measured). At KV_GROUP=1 this body is exactly the ungrouped kernel.
++    for g in tl.static_range(KV_GROUP):
++        n_start = group_start + g * BLOCK_N
++        offs_n = n_start + tl.arange(0, BLOCK_N)
++        mask_n = offs_n < N
++        if (n_start >= ke) | (n_start + BLOCK_N <= ks):
++            tl.store(
++                logits_ptr + m * stride_l_m + offs_n * stride_l_n,
++                tl.full([BLOCK_N], float("-inf"), dtype=tl.float32),
++                mask=mask_n,
++            )
++        else:
++            k = tl.load(
++                k_ptr + offs_n[:, None] * stride_k_n + offs_d[None, :] * stride_k_d,
++                mask=mask_n[:, None] & mask_d[None, :],
++                other=0.0,
++            )
++            k_scale = tl.load(k_scale_ptr + offs_n, mask=mask_n, other=0.0)
++            s = tl.dot(q, tl.trans(k))
++
++            # relu is positively homogeneous and k_scale is a quantization
++            # magnitude (>= 0), so the scale factors straight out of the head
++            # sum: BLOCK_H x BLOCK_N broadcast multiplies become BLOCK_N. The
++            # relu's threshold is at zero and a non-negative scale cannot move
++            # a sign, so the top-k's SELECTED set is bit-identical; only the
++            # sum's rounding order changes (one scaling instead of BLOCK_H).
++            if FACTOR_K_SCALE:
++                s = tl.where(s > 0, s, 0.0) * w[:, None]
++                out = tl.sum(s, axis=0) * k_scale
++            else:
++                s = s * k_scale[None, :]
++                s = tl.where(s > 0, s, 0.0) * w[:, None]
++                out = tl.sum(s, axis=0)
++
++            # Store mask covers mask_n; -inf masks [ks, ke) only.
++            out = tl.where((offs_n >= ks) & (offs_n < ke), out, float("-inf"))
++
++            tl.store(
++                logits_ptr + m * stride_l_m + offs_n * stride_l_n,
++                out,
++                mask=mask_n,
++            )
++
++
++@functools.cache
++def _kv_group_min_ctas(device_index: int) -> int:
++    return num_compute_units(device_index) * _KV_GROUP_CTAS_PER_SM
++
++
++def _select_prefill_kv_group(m: int, n: int, device_index: int = 0) -> int:
++    return 1
++
++
++def fp8_mqa_logits_triton(
++    q: torch.Tensor,
++    kv: tuple[torch.Tensor, torch.Tensor],
++    weights: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++    clean_logits: bool = True,
++) -> torch.Tensor:
++    """Triton implementation of DeepGEMM's fp8_mqa_logits.
++
++    Args:
++        q:            [M, H, D] fp8_e4m3fn
++        kv:           (k_fp8 [N, D], k_scales [N]) — fp8_e4m3fn, float32
++        weights:      [M, H] float32
++        cu_seqlen_ks: [M] int32
++        cu_seqlen_ke: [M] int32
++        clean_logits: when False, skip the -inf pre-fill of the output
++            (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
++    Returns:
++        logits:       [M, N] float32
++    """
++    return _fp8_mqa_logits_triton_impl(
++        q,
++        kv,
++        weights,
++        cu_seqlen_ks,
++        cu_seqlen_ke,
++        _select_prefill_kv_group(q.shape[0], kv[0].shape[0]),
++    )
++
++
++def _fp8_mqa_logits_triton_impl(
++    q: torch.Tensor,
++    kv: tuple[torch.Tensor, torch.Tensor],
++    weights: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++    kv_group: int,
++) -> torch.Tensor:
++    k_fp8, k_scales = kv
++    k_scales = k_scales.reshape(-1)
++
++    M, num_heads, head_dim = q.shape
++    N = k_fp8.shape[0]
++
++    # The grid covers every (m, n_block) and each tile stores its full row
++    # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
++    # is accepted for DeepGEMM signature parity only.
++    logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
++
++    BLOCK_H = max(16, triton.next_power_of_2(num_heads))
++    BLOCK_D = triton.next_power_of_2(head_dim)
++
++    # Pre-decode FP8 → bf16; the kernel runs a straight `tl.dot`.
++    q_bf16 = q.to(torch.bfloat16)
++    k_bf16 = k_fp8.to(torch.bfloat16)
++
++    # Grid depends on the autotuned BLOCK_N and the M/N-selected KV_GROUP.
++    grid = lambda meta: (  # noqa: E731
++        M,
++        triton.cdiv(N, meta["BLOCK_N"] * meta["KV_GROUP"]),
++    )
++    _fp8_mqa_logits_kernel[grid](
++        q_bf16,
++        k_bf16,
++        k_scales,
++        weights,
++        cu_seqlen_ks,
++        cu_seqlen_ke,
++        logits,
++        q_bf16.stride(0),
++        q_bf16.stride(1),
++        q_bf16.stride(2),
++        k_bf16.stride(0),
++        k_bf16.stride(1),
++        weights.stride(0),
++        weights.stride(1),
++        logits.stride(0),
++        logits.stride(1),
++        num_heads=num_heads,
++        head_dim=head_dim,
++        N=N,
++        BLOCK_H=BLOCK_H,
++        BLOCK_D=BLOCK_D,
++        KV_GROUP=kv_group,
++        FACTOR_K_SCALE=False,
++    )
++    return logits
++
++
++def warmup_fp8_mqa_logits_triton(
++    num_heads: int,
++    head_dim: int,
++    device: torch.device,
++) -> None:
++    """Prime the prefill `@triton.autotune` cache so first-call doesn't pay
++    the inline sweep (~5–8 s on A100 SM80). KV_GROUP is an M/N-selected
++    constexpr, so on SM80 warm both specializations at the small warmup shape:
++    the short-N shape runs the tuner sweep, then the forced grouped launch just
++    JIT-compiles against the cached best config. Other devices need only the
++    ungrouped specialization."""
++    _warmup_fp8_mqa_logits_shape(
++        num_heads, head_dim, _PREFILL_WARMUP_M, _PREFILL_WARMUP_N, device
++    )
++    if _IS_SM80:
++        _warmup_fp8_mqa_logits_shape(
++            num_heads,
++            head_dim,
++            _PREFILL_WARMUP_M,
++            _KV_GROUP_MIN_N,
++            device,
++            kv_group_override=_KV_GROUP,
++        )
++
++
++def _warmup_fp8_mqa_logits_shape(
++    num_heads: int,
++    head_dim: int,
++    m: int,
++    n: int,
++    device: torch.device,
++    kv_group_override: int | None = None,
++) -> None:
++    q = torch.empty(m, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
++    k = torch.empty(n, head_dim, dtype=torch.float8_e4m3fn, device=device)
++    scales = torch.zeros(n, dtype=torch.float32, device=device)
++    weights = torch.zeros(m, num_heads, dtype=torch.float32, device=device)
++    ks = torch.zeros(m, dtype=torch.int32, device=device)
++    ke = torch.full((m,), n, dtype=torch.int32, device=device)
++    kv_group = (
++        _select_prefill_kv_group(m, n)
++        if kv_group_override is None
++        else kv_group_override
++    )
++    _fp8_mqa_logits_triton_impl(q, (k, scales), weights, ks, ke, kv_group)
++
++
++def warmup_fp8_paged_mqa_logits_triton(
++    num_heads: int,
++    head_dim: int,
++    block_size: int,
++    device: torch.device,
++) -> None:
++    """Prime the paged-decode `@triton.autotune` cache for the indexer's
++    logits kernel (see `warmup_fp8_mqa_logits_triton` for rationale).
++    """
++    num_blocks = 2
++    q = torch.empty(1, 1, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
++    kv_cache = torch.zeros(
++        num_blocks, block_size, 1, head_dim + 4, dtype=torch.uint8, device=device
++    )
++    weights = torch.zeros(1, num_heads, dtype=torch.float32, device=device)
++    context_lens = torch.tensor([block_size], dtype=torch.int32, device=device)
++    block_tables = torch.zeros(1, 1, dtype=torch.int32, device=device)
++    fp8_paged_mqa_logits_triton(
++        q, kv_cache, weights, context_lens, block_tables, max_model_len=block_size
++    )
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+index 5c9ab386d4..5785a50c06 100644
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -16,6 +16,7 @@ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import LayerNameType
+ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if current_platform.is_rocm():
+@@ -1335,10 +1336,7 @@ def _load_fp8_ds_mla_gfx950_nope_exact_chunk(
+     scales = _decode_e8m0_scales_triton(encoded_scales)
+     scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, CHUNK_SIZE // 64, 64))
+     scales = tl.reshape(scales, (BLOCK_K, CHUNK_SIZE))
+-    if IS_FNUZ:
+-        x_f32 = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.bfloat16).to(tl.float32)
+-    else:
+-        x_f32 = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ)
+     value = (x_f32 * scales).to(tl.bfloat16)
+     zero = tl.zeros((BLOCK_K, CHUNK_SIZE), dtype=tl.bfloat16)
+     return tl.where(valid[:, None], value, zero)
+@@ -1370,10 +1368,7 @@ def _load_fp8_ds_mla_gfx950_tail128(
+     scales = _decode_e8m0_scales_triton(encoded_scales)
+     scales = tl.broadcast_to(scales[:, :, None], (BLOCK_K, 2, 64))
+     scales = tl.reshape(scales, (BLOCK_K, 128))
+-    if IS_FNUZ:
+-        x_f32 = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.bfloat16).to(tl.float32)
+-    else:
+-        x_f32 = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    x_f32 = _decode_fp8_f32(x_uint8, IS_FNUZ)
+     nope = (x_f32 * scales).to(tl.bfloat16)
+ 
+     rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+@@ -1475,17 +1470,14 @@ def _sparse_attn_decode_ragged_kernel(
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+-        if IS_FNUZ_MAIN:
+-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-        else:
+-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++        k_vals = _decode_fp8_f32(x_uint8, IS_FNUZ_MAIN)
+         encoded_scales = tl.load(
+             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+             mask=valid[:, None] & nope_mask[None, :],
+             other=127,
+         )
+         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -1543,17 +1535,14 @@ def _sparse_attn_decode_ragged_kernel(
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+-            if IS_FNUZ_EXTRA:
+-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-            else:
+-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++            k_vals = _decode_fp8_f32(x_uint8, IS_FNUZ_EXTRA)
+             encoded_scales = tl.load(
+                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=127,
+             )
+             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -1725,17 +1714,14 @@ def _sparse_attn_decode_partial_kernel(
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+-        if IS_FNUZ_MAIN:
+-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-        else:
+-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++        k_vals = _decode_fp8_f32(x_uint8, IS_FNUZ_MAIN)
+         encoded_scales = tl.load(
+             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+             mask=valid[:, None] & nope_mask[None, :],
+             other=127,
+         )
+         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -1796,17 +1782,14 @@ def _sparse_attn_decode_partial_kernel(
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+-            if IS_FNUZ_EXTRA:
+-                x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+-            else:
+-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
++            k_vals = _decode_fp8_f32(x_uint8, IS_FNUZ_EXTRA)
+             encoded_scales = tl.load(
+                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=127,
+             )
+             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
++            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+diff --git a/vllm/v1/attention/ops/triton_mla_sparse_kernel.py b/vllm/v1/attention/ops/triton_mla_sparse_kernel.py
+new file mode 100644
+index 0000000000..bbcd5ca152
+--- /dev/null
++++ b/vllm/v1/attention/ops/triton_mla_sparse_kernel.py
+@@ -0,0 +1,551 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Triton sparse MLA attention with split-KV for low-batch decode."""
++
++import functools
++
++import torch
++
++from vllm.triton_utils import LOG2E, LOGE2, tl, triton
++from vllm.utils.platform_utils import num_compute_units
++
++# DeepSeek-V3.2 / GLM-5 sparse MLA shape constants.
++_BLOCK_DMODEL = 512
++_BLOCK_DPE = 64
++_BLOCK_DV = 512
++_DIM_QK = _BLOCK_DMODEL + _BLOCK_DPE  # 576
++
++_BLOCK_H = 16
++
++# Merge kernel grid is spread across heads and DV tiles to avoid a (1,1)
++# launch starving the SMs (pattern from FlashMLA's combine kernel).
++_MERGE_BLOCK_H = 1
++_MERGE_BLOCK_DV_TILE = 128
++_NUM_MERGE_DV_TILES = _BLOCK_DV // _MERGE_BLOCK_DV_TILE
++
++# Final (prefill) and split (decode) kernels each tune to their own regime.
++_FINAL_AUTOTUNE_CONFIGS = [
++    triton.Config({"BLOCK_N": 16}, num_warps=nw, num_stages=ns)
++    for nw in (2, 4)
++    for ns in (2, 4)
++]
++_SPLIT_AUTOTUNE_CONFIGS = [
++    triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=ns) for ns in (2, 4)
++]
++
++# Smallest BLOCK_N the sweep offers; the topk-divisibility check at
++# dispatch time keeps every tile full.
++_MIN_BLOCK_N = min(
++    c.kwargs["BLOCK_N"] for c in _FINAL_AUTOTUNE_CONFIGS + _SPLIT_AUTOTUNE_CONFIGS
++)
++
++# Split-count candidates for `_choose_num_kv_splits`; also the set pre-compiled
++# by `_warmup_autotune`.
++KV_SPLITS_CANDIDATES = (1, 2, 4, 8, 16)
++
++_MIN_TOPK_PER_SPLIT = 128  # below this, per-split work is too small to amortize
++_SPLIT_MAX_OCCUPANCY = 4  # skip split when baseline grid fills >=1/4 of SMs
++
++
++@triton.jit
++def _sparse_mla_compute_tile(
++    q_buffer,
++    k_buffer,  # V is the first BLOCK_DV lanes of each row of k_buffer.
++    indices_ptr,
++    cur_q,
++    cur_head,
++    cur_kv_head_id,
++    mask_h,
++    split_start,
++    split_end,
++    seq_kv,
++    stride_q_token,
++    stride_q_head,
++    stride_kv_token,
++    stride_kv_head,
++    stride_indices_token,
++    stride_indices_head,
++    sm_scale,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_DV: tl.constexpr,
++    BLOCK_DMODEL: tl.constexpr,
++    BLOCK_DPE: tl.constexpr,
++):
++    """Shared stage-1 body: load Q, run the sparse online-softmax loop over
++    `[split_start, split_end)` of the topk axis, return accumulators."""
++    offs_d = tl.arange(0, BLOCK_DMODEL)
++    offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
++    offs_dv = tl.arange(0, BLOCK_DV)
++
++    q = tl.load(
++        q_buffer
++        + cur_q * stride_q_token
++        + cur_head[:, None] * stride_q_head
++        + offs_d[None, :],
++        mask=mask_h[:, None],
++        other=0.0,
++    )
++    qpe = tl.load(
++        q_buffer
++        + cur_q * stride_q_token
++        + cur_head[:, None] * stride_q_head
++        + offs_dpe[None, :],
++        mask=mask_h[:, None],
++        other=0.0,
++    )
++
++    # Finite sentinel (not -inf) — when an entire BLOCK_N tile is masked,
++    # `-inf - -inf = NaN` poisons the softmax; `sentinel - sentinel = 0`
++    # gives `exp2(0) = 1` and the matching V rows are already 0.
++    NEG_LARGE = -1.0e30
++    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) + NEG_LARGE
++    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
++    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
++
++    for start_indice in range(split_start, split_end, BLOCK_N):
++        offs_indice = start_indice + tl.arange(0, BLOCK_N)
++        mask_indice = offs_indice < split_end
++        indices = tl.load(
++            indices_ptr
++            + cur_q * stride_indices_token
++            + cur_kv_head_id * stride_indices_head
++            + offs_indice,
++            mask=mask_indice,
++            other=-1,
++        )
++        mask_kv = (indices >= 0) & (indices < seq_kv)
++
++        offs_k = (
++            indices[None, :] * stride_kv_token
++            + cur_kv_head_id * stride_kv_head
++            + offs_d[:, None]
++        )
++        k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
++        qk = tl.dot(q, k.to(q.dtype))
++
++        offs_kpe = (
++            indices[None, :] * stride_kv_token
++            + cur_kv_head_id * stride_kv_head
++            + offs_dpe[:, None]
++        )
++        kpe = tl.load(
++            k_buffer + offs_kpe,
++            mask=mask_kv[None, :],
++            other=0.0,
++        )
++        qk += tl.dot(qpe, kpe.to(q.dtype))
++
++        qk *= sm_scale
++        qk = tl.where((mask_h[:, None]) & (mask_kv[None, :]), qk, NEG_LARGE)
++
++        offs_v = (
++            indices[:, None] * stride_kv_token
++            + cur_kv_head_id * stride_kv_head
++            + offs_dv[None, :]
++        )
++        v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
++
++        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
++        re_scale = tl.exp2(e_max - n_e_max)
++        p = tl.exp2(qk - n_e_max[:, None])
++        acc *= re_scale[:, None]
++        acc += tl.dot(p.to(v.dtype), v)
++        e_sum = e_sum * re_scale + tl.sum(p, 1)
++        e_max = n_e_max
++
++    return acc, e_max, e_sum
++
++
++@triton.autotune(configs=_FINAL_AUTOTUNE_CONFIGS, key=["index_topk", "kv_group_num"])
++@triton.jit
++def _sparse_mla_kernel_final(
++    q_buffer,
++    k_buffer,
++    indices_ptr,
++    out_ptr,
++    seq_kv,
++    h_q,
++    stride_q_token,
++    stride_q_head,
++    stride_kv_token,
++    stride_kv_head,
++    stride_out_token,
++    stride_out_head,
++    stride_indices_token,
++    stride_indices_head,
++    sm_scale,
++    index_topk: tl.constexpr,
++    kv_group_num: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_DV: tl.constexpr,
++    BLOCK_DMODEL: tl.constexpr,
++    BLOCK_DPE: tl.constexpr,
++):
++    """Single-pass fast path: full topk, write final bf16 output directly."""
++    cur_q = tl.program_id(0)
++    cur_head_id = tl.program_id(1)
++    cur_kv_head_id = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
++
++    VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
++    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
++    mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < h_q)
++
++    acc, _, e_sum = _sparse_mla_compute_tile(
++        q_buffer,
++        k_buffer,
++        indices_ptr,
++        cur_q,
++        cur_head,
++        cur_kv_head_id,
++        mask_h,
++        0,
++        index_topk,
++        seq_kv,
++        stride_q_token,
++        stride_q_head,
++        stride_kv_token,
++        stride_kv_head,
++        stride_indices_token,
++        stride_indices_head,
++        sm_scale,
++        BLOCK_H,
++        BLOCK_N,
++        BLOCK_DV,
++        BLOCK_DMODEL,
++        BLOCK_DPE,
++    )
++
++    # Guard against queries with zero valid KV (e_sum == 0 → NaN from 0/0).
++    e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
++    offs_dv = tl.arange(0, BLOCK_DV)
++    tl.store(
++        out_ptr
++        + cur_q * stride_out_token
++        + cur_head[:, None] * stride_out_head
++        + offs_dv[None, :],
++        (acc / e_sum_safe[:, None]).to(tl.bfloat16),
++        mask=mask_h[:, None],
++    )
++
++
++@triton.autotune(
++    configs=_SPLIT_AUTOTUNE_CONFIGS,
++    key=["index_topk", "NUM_KV_SPLITS", "kv_group_num"],
++)
++@triton.jit
++def _sparse_mla_kernel_split(
++    q_buffer,
++    k_buffer,
++    indices_ptr,
++    mid_out_ptr,
++    seq_kv,
++    h_q,
++    stride_q_token,
++    stride_q_head,
++    stride_kv_token,
++    stride_kv_head,
++    stride_mid_token,
++    stride_mid_head,
++    stride_mid_split,
++    stride_indices_token,
++    stride_indices_head,
++    sm_scale,
++    index_topk: tl.constexpr,
++    NUM_KV_SPLITS: tl.constexpr,
++    kv_group_num: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_DV: tl.constexpr,
++    BLOCK_DMODEL: tl.constexpr,
++    BLOCK_DPE: tl.constexpr,
++    LOGE2: tl.constexpr,
++):
++    """Stage 1 of split-KV: process one slice of the topk axis and write
++    its `(out_partial, lse_partial)` into the mid buffer."""
++    cur_q = tl.program_id(0)
++    cur_head_id = tl.program_id(1)
++    split_kv_id = tl.program_id(2)
++    cur_kv_head_id = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
++
++    VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
++    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
++    mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < h_q)
++
++    split_topk: tl.constexpr = tl.cdiv(index_topk, NUM_KV_SPLITS)
++    split_start = split_kv_id * split_topk
++    split_end = tl.minimum(split_start + split_topk, index_topk)
++
++    acc, e_max, e_sum = _sparse_mla_compute_tile(
++        q_buffer,
++        k_buffer,
++        indices_ptr,
++        cur_q,
++        cur_head,
++        cur_kv_head_id,
++        mask_h,
++        split_start,
++        split_end,
++        seq_kv,
++        stride_q_token,
++        stride_q_head,
++        stride_kv_token,
++        stride_kv_head,
++        stride_indices_token,
++        stride_indices_head,
++        sm_scale,
++        BLOCK_H,
++        BLOCK_N,
++        BLOCK_DV,
++        BLOCK_DMODEL,
++        BLOCK_DPE,
++    )
++
++    # Partial output and natural-log LSE for stage-2 merge.
++    # When a split has no valid KV (`e_sum == 0`), guard the divide so the
++    # mid buffer holds 0 instead of NaN; otherwise the `0 * NaN = NaN` term
++    # in stage 2 would poison every other split.
++    e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
++    offs_dv = tl.arange(0, BLOCK_DV)
++    mid_base_2d = (
++        mid_out_ptr
++        + cur_q * stride_mid_token
++        + cur_head[:, None] * stride_mid_head
++        + split_kv_id * stride_mid_split
++    )
++    tl.store(
++        mid_base_2d + offs_dv[None, :],
++        acc / e_sum_safe[:, None],
++        mask=mask_h[:, None],
++    )
++    mid_lse_ptr = (
++        mid_out_ptr
++        + cur_q * stride_mid_token
++        + cur_head * stride_mid_head
++        + split_kv_id * stride_mid_split
++        + BLOCK_DV
++    )
++    tl.store(mid_lse_ptr, (e_max + tl.log2(e_sum)) * LOGE2, mask=mask_h)
++
++
++@triton.jit
++def _sparse_mla_merge_kernel(
++    mid_out_ptr,
++    out_ptr,
++    h_q,
++    stride_mid_token,
++    stride_mid_head,
++    stride_mid_split,
++    stride_out_token,
++    stride_out_head,
++    NUM_KV_SPLITS: tl.constexpr,
++    kv_group_num: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_DV: tl.constexpr,
++    BLOCK_DV_TILE: tl.constexpr,
++):
++    """Stage 2: N-way online-softmax merge of per-split `(out, lse)` tiles.
++
++    Grid is `(num_tokens, num_head_groups, num_dv_tiles)`. Each program handles
++    `BLOCK_H` heads × `BLOCK_DV_TILE` output-dim lanes. The LSE reduction is
++    identical across DV tiles for the same (token, head) — each program
++    recomputes it locally, which is cheap (O(NUM_KV_SPLITS) scalars) and
++    avoids inter-CTA synchronization.
++    """
++    cur_q = tl.program_id(0)
++    cur_head_id = tl.program_id(1)
++    cur_dv_tile = tl.program_id(2)
++
++    VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
++    cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
++    mask_h = (cur_head < (cur_head_id + 1) * VALID_BLOCK_H) & (cur_head < h_q)
++
++    offs_dv = cur_dv_tile * BLOCK_DV_TILE + tl.arange(0, BLOCK_DV_TILE)
++    mask_dv = offs_dv < BLOCK_DV
++    # Finite sentinel — same NaN guard as the split kernel for empty splits.
++    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - 1.0e30
++    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
++    acc = tl.zeros([BLOCK_H, BLOCK_DV_TILE], dtype=tl.float32)
++
++    mid_base_2d = (
++        mid_out_ptr + cur_q * stride_mid_token + cur_head[:, None] * stride_mid_head
++    )
++    mid_lse_1d = (
++        mid_out_ptr + cur_q * stride_mid_token + cur_head * stride_mid_head + BLOCK_DV
++    )
++
++    for split_kv_id in range(NUM_KV_SPLITS):
++        tv = tl.load(
++            mid_base_2d + split_kv_id * stride_mid_split + offs_dv[None, :],
++            mask=mask_h[:, None] & mask_dv[None, :],
++            other=0.0,
++        )
++        tlogic = tl.load(
++            mid_lse_1d + split_kv_id * stride_mid_split,
++            mask=mask_h,
++            other=-float("inf"),
++        )
++        n_e_max = tl.maximum(tlogic, e_max)
++        old_scale = tl.exp(e_max - n_e_max)
++        exp_logic = tl.exp(tlogic - n_e_max)
++        acc = acc * old_scale[:, None] + exp_logic[:, None] * tv
++        e_sum = e_sum * old_scale + exp_logic
++        e_max = n_e_max
++
++    e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
++    tl.store(
++        out_ptr
++        + cur_q * stride_out_token
++        + cur_head[:, None] * stride_out_head
++        + offs_dv[None, :],
++        (acc / e_sum_safe[:, None]).to(tl.bfloat16),
++        mask=mask_h[:, None] & mask_dv[None, :],
++    )
++
++
++@functools.lru_cache(maxsize=256)
++def _choose_num_kv_splits(
++    num_tokens: int, num_head_groups: int, index_topk: int, sm_count: int
++) -> int:
++    """Pick a power-of-2 split count that fills the device without dropping
++    per-split work below _MIN_TOPK_PER_SPLIT. Returns 1 when the single-pass
++    grid already reaches ~1/_SPLIT_MAX_OCCUPANCY utilization.
++    """
++    baseline = num_tokens * num_head_groups
++    if baseline == 0 or baseline * _SPLIT_MAX_OCCUPANCY >= sm_count:
++        return 1
++    ideal = triton.next_power_of_2(max(1, index_topk // _MIN_TOPK_PER_SPLIT))
++    max_splits = max(1, sm_count // baseline)
++    max_splits = 1 << (max_splits.bit_length() - 1)  # floor to power of 2
++    num_kv_splits = min(ideal, max_splits)
++    while num_kv_splits > 1 and index_topk % num_kv_splits != 0:
++        num_kv_splits //= 2
++    return max(1, num_kv_splits)
++
++
++def triton_mla_sparse_attention(
++    q: torch.Tensor,
++    kv: torch.Tensor,
++    indices: torch.Tensor,
++    sm_scale: float,
++    num_kv_splits: int | None = None,
++    sm_count: int | None = None,
++) -> torch.Tensor:
++    """Sparse MLA attention over topk indices.
++
++    Args:
++        q:         [num_tokens, num_heads_q, dim_qk] bf16
++        kv:        [seq_kv, num_heads_kv=1, dim_qk] bf16
++        indices:   [num_tokens, num_heads_kv=1, topk] int32
++        sm_scale:  softmax scale
++        num_kv_splits: override auto-heuristic; None/0 = auto, 1 = force single-pass.
++        sm_count:  cached device SM count for the split heuristic.
++
++    Returns:
++        out:   [num_tokens, num_heads_q, _BLOCK_DV] bf16
++    """
++    num_tokens, num_heads_q, dim_qk = q.shape
++    assert dim_qk == _DIM_QK, (
++        f"sparse MLA kernel requires dim_qk={_DIM_QK} (DeepSeek-V3.2 / GLM-5), "
++        f"got {dim_qk}"
++    )
++    assert kv.shape[1] == 1 and kv.shape[2] == _DIM_QK
++    index_topk = indices.shape[2]
++    assert index_topk % _MIN_BLOCK_N == 0, (
++        f"topk ({index_topk}) must be a multiple of the smallest autotune "
++        f"BLOCK_N ({_MIN_BLOCK_N})"
++    )
++
++    kv_group_num = num_heads_q
++    num_head_groups = triton.cdiv(num_heads_q, min(_BLOCK_H, kv_group_num))
++
++    if num_kv_splits is None or num_kv_splits == 0:
++        if sm_count is None:
++            sm_count = num_compute_units(q.device.index)
++        num_kv_splits = _choose_num_kv_splits(
++            num_tokens, num_head_groups, index_topk, sm_count
++        )
++
++    out = torch.empty(
++        (num_tokens, num_heads_q, _BLOCK_DV),
++        dtype=torch.bfloat16,
++        device=q.device,
++    )
++
++    if num_kv_splits == 1:
++        _sparse_mla_kernel_final[(num_tokens, num_head_groups)](
++            q_buffer=q,
++            k_buffer=kv,
++            indices_ptr=indices,
++            out_ptr=out,
++            seq_kv=kv.shape[0],
++            h_q=num_heads_q,
++            stride_q_token=q.stride(0),
++            stride_q_head=q.stride(1),
++            stride_kv_token=kv.stride(0),
++            stride_kv_head=kv.stride(1),
++            stride_out_token=out.stride(0),
++            stride_out_head=out.stride(1),
++            stride_indices_token=indices.stride(0),
++            stride_indices_head=indices.stride(1),
++            sm_scale=sm_scale * LOG2E,
++            index_topk=index_topk,
++            kv_group_num=kv_group_num,
++            BLOCK_H=_BLOCK_H,
++            BLOCK_DV=_BLOCK_DV,
++            BLOCK_DMODEL=_BLOCK_DMODEL,
++            BLOCK_DPE=_BLOCK_DPE,
++        )
++        return out
++
++    # Split-KV: partial fp32 output + LSE per (token, head, split).
++    mid_out = torch.empty(
++        (num_tokens, num_heads_q, num_kv_splits, _BLOCK_DV + 1),
++        dtype=torch.float32,
++        device=q.device,
++    )
++    _sparse_mla_kernel_split[(num_tokens, num_head_groups, num_kv_splits)](
++        q_buffer=q,
++        k_buffer=kv,
++        indices_ptr=indices,
++        mid_out_ptr=mid_out,
++        seq_kv=kv.shape[0],
++        h_q=num_heads_q,
++        stride_q_token=q.stride(0),
++        stride_q_head=q.stride(1),
++        stride_kv_token=kv.stride(0),
++        stride_kv_head=kv.stride(1),
++        stride_mid_token=mid_out.stride(0),
++        stride_mid_head=mid_out.stride(1),
++        stride_mid_split=mid_out.stride(2),
++        stride_indices_token=indices.stride(0),
++        stride_indices_head=indices.stride(1),
++        sm_scale=sm_scale * LOG2E,
++        index_topk=index_topk,
++        NUM_KV_SPLITS=num_kv_splits,
++        kv_group_num=kv_group_num,
++        BLOCK_H=_BLOCK_H,
++        BLOCK_DV=_BLOCK_DV,
++        BLOCK_DMODEL=_BLOCK_DMODEL,
++        BLOCK_DPE=_BLOCK_DPE,
++        LOGE2=LOGE2,
++    )
++
++    _sparse_mla_merge_kernel[(num_tokens, num_heads_q, _NUM_MERGE_DV_TILES)](
++        mid_out_ptr=mid_out,
++        out_ptr=out,
++        h_q=num_heads_q,
++        stride_mid_token=mid_out.stride(0),
++        stride_mid_head=mid_out.stride(1),
++        stride_mid_split=mid_out.stride(2),
++        stride_out_token=out.stride(0),
++        stride_out_head=out.stride(1),
++        NUM_KV_SPLITS=num_kv_splits,
++        kv_group_num=kv_group_num,
++        BLOCK_H=_MERGE_BLOCK_H,
++        BLOCK_DV=_BLOCK_DV,
++        BLOCK_DV_TILE=_MERGE_BLOCK_DV_TILE,
++        num_warps=2,
++    )
++    return out

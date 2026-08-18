@@ -1,24 +1,32 @@
-From bd0a2d173c431e77e8148032c33256b767dacb9a Mon Sep 17 00:00:00 2001
+From 093f499d49b461edf1ef231dfb9bb62f39d010a3 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Date: Tue, 18 Aug 2026 02:10:58 +0800
-Subject: [PATCH 2/2] Apply deepseek-v4-cmp170hx downstream patches on upstream
- main
+Date: Tue, 18 Aug 2026 10:41:12 +0800
+Subject: [PATCH 3/3] Apply deepseek-v4-cmp170hx downstream serving fixes
 
 ---
- .../responses/test_function_call_parsing.py   |  26 ++++
- .../v1/simple_kv_offload/test_disk_backend.py |  45 ++++++
+ .../responses/test_function_call_parsing.py   |  26 +++
+ .../v1/simple_kv_offload/test_disk_backend.py |  45 +++++
  vllm/config/speculative.py                    |   3 +
+ .../openai/chat_completion/protocol.py        |   4 +
+ vllm/entrypoints/openai/engine/protocol.py    |   3 +
  vllm/entrypoints/openai/responses/protocol.py |  17 +-
- .../layers/sparse_attn_indexer.py             | 145 ++++++++++++++++--
- vllm/v1/simple_kv_offload/cuda_mem_ops.py     |  28 ++--
- vllm/v1/simple_kv_offload/disk_backend.py     |  77 ++++++----
+ .../layers/sparse_attn_indexer.py             | 145 ++++++++++++--
+ vllm/parser/deepseek_v32.py                   |  33 ++++
+ vllm/parser/deepseek_v4.py                    |  37 ++++
+ vllm/parser/engine/parser_engine.py           |  59 +++++-
+ vllm/parser/engine/parser_engine_config.py    |   8 +
+ vllm/tokenizers/deepseek_v4_encoding.py       |  17 +-
+ vllm/tool_parsers/utils.py                    |  17 ++
+ vllm/v1/executor/multiproc_executor.py        |   4 +-
+ vllm/v1/simple_kv_offload/cuda_mem_ops.py     |  28 ++-
+ vllm/v1/simple_kv_offload/disk_backend.py     |  77 ++++----
  vllm/v1/simple_kv_offload/worker.py           |  10 +-
- vllm/v1/structured_output/__init__.py         |  21 ++-
- vllm/v1/structured_output/backend_xgrammar.py |  21 ++-
+ vllm/v1/structured_output/__init__.py         | 179 +++++++++++++-----
+ vllm/v1/structured_output/backend_xgrammar.py |  32 +++-
  vllm/v1/worker/gpu/model_runner.py            |  14 +-
- vllm/v1/worker/gpu/pp_utils.py                |  63 ++++++++
- .../v1/worker/gpu/spec_decode/dspark/utils.py |  90 ++++++++++-
- 13 files changed, 488 insertions(+), 72 deletions(-)
+ vllm/v1/worker/gpu/pp_utils.py                |  63 ++++++
+ .../v1/worker/gpu/spec_decode/dspark/utils.py |  90 ++++++++-
+ 22 files changed, 789 insertions(+), 122 deletions(-)
  create mode 100644 tests/v1/simple_kv_offload/test_disk_backend.py
 
 diff --git a/tests/entrypoints/openai/responses/test_function_call_parsing.py b/tests/entrypoints/openai/responses/test_function_call_parsing.py
@@ -120,6 +128,35 @@ index a85b895d86..e11d2fd8be 100644
  
          if self.method != "dspark" and self.enable_adaptive_verification:
              raise ValueError("Adaptive verification only supported with DSpark")
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index e8bb4e5678..146e30f75b 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -76,6 +76,10 @@ class ChatMessage(OpenAIBaseModel):
+         data = handler(self)
+         if len(data.get("tool_calls", [])) == 0:
+             data.pop("tool_calls", None)
++        # DeepSeek-API-compatible clients read ``reasoning_content``; the
++        # request side already accepts it as an alias, so mirror on output.
++        if data.get("reasoning") is not None:
++            data.setdefault("reasoning_content", data["reasoning"])
+         return data
+ 
+ 
+diff --git a/vllm/entrypoints/openai/engine/protocol.py b/vllm/entrypoints/openai/engine/protocol.py
+index c32be4459c..2cc3a35026 100644
+--- a/vllm/entrypoints/openai/engine/protocol.py
++++ b/vllm/entrypoints/openai/engine/protocol.py
+@@ -412,6 +412,9 @@ class DeltaMessage(OpenAIBaseModel):
+         data = handler(self)
+         if len(data.get("tool_calls", [])) == 0:
+             data.pop("tool_calls", None)
++        # Mirror for DeepSeek-API-compatible clients (see ChatMessage).
++        if data.get("reasoning") is not None:
++            data.setdefault("reasoning_content", data["reasoning"])
+         return data
+ 
+ 
 diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
 index ff3331612f..378f94080a 100644
 --- a/vllm/entrypoints/openai/responses/protocol.py
@@ -346,6 +383,367 @@ index d556480634..bd9d409a53 100644
  
              _merge_dcp_topk_global(
                  logits,
+diff --git a/vllm/parser/deepseek_v32.py b/vllm/parser/deepseek_v32.py
+index 0d9ac9f53c..30768d660f 100644
+--- a/vllm/parser/deepseek_v32.py
++++ b/vllm/parser/deepseek_v32.py
+@@ -26,6 +26,8 @@ from vllm.parser.deepseek_v4 import (
+     DSML_INVOKE_NAME_END,
+     DSML_INVOKE_PREFIX,
+     DSML_PARAM_CLOSE,
++    DSML_TOOL_END,
++    DSML_TOOL_START,
+     _dsml_arg_converter,
+     _unwrap_wrapper_args,
+ )
+@@ -59,6 +61,8 @@ def deepseek_v32_config() -> ParserEngineConfig:
+             "INVOKE_NAME_END": DSML_INVOKE_NAME_END,
+             "INVOKE_END": DSML_INVOKE_END,
+             "PARAM_CLOSE": DSML_PARAM_CLOSE,
++            "FOREIGN_START": DSML_TOOL_START,
++            "FOREIGN_END": DSML_TOOL_END,
+         },
+         token_id_terminals={
+             "TOOL_START": DSML_FUNC_START,
+@@ -69,6 +73,34 @@ def deepseek_v32_config() -> ParserEngineConfig:
+                 ParserState.TOOL_PREAMBLE,
+                 (),
+             ),
++            # Orphan invoke: at long context the model may omit the
++            # <｜DSML｜function_calls> wrapper and emit the invoke
++            # directly.  The invoke marker has no dedicated special
++            # token, so hold events and validate the parsed name
++            # before committing.  Only names the request declared are
++            # accepted.
++            (ParserState.CONTENT, "INVOKE_PREFIX"): Transition(
++                ParserState.TOOL_NAME,
++                (EventType.TOOL_CALL_START,),
++                validate_tool_name=True,
++            ),
++            # V4-style tool_calls wrapper is foreign to V3.2: pass it
++            # and its contents through as plain content
++            (ParserState.CONTENT, "FOREIGN_START"): Transition(
++                ParserState.FOREIGN_BLOCK,
++                (EventType.TEXT_CHUNK,),
++            ),
++            (ParserState.FOREIGN_BLOCK, "FOREIGN_END"): Transition(
++                ParserState.CONTENT,
++                (EventType.TEXT_CHUNK,),
++            ),
++            # The native wrapper always wins over an unclosed foreign
++            # block, so a stray foreign start cannot disable tool
++            # parsing for the rest of the response.
++            (ParserState.FOREIGN_BLOCK, "TOOL_START"): Transition(
++                ParserState.TOOL_PREAMBLE,
++                (),
++            ),
+             (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
+                 ParserState.TOOL_NAME,
+                 (EventType.TOOL_CALL_START,),
+@@ -99,6 +131,7 @@ def deepseek_v32_config() -> ParserEngineConfig:
+             ParserState.CONTENT: EventType.TEXT_CHUNK,
+             ParserState.TOOL_NAME: EventType.TOOL_NAME,
+             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
++            ParserState.FOREIGN_BLOCK: EventType.TEXT_CHUNK,
+         },
+         arg_converter=_dsml_arg_converter,
+         arg_structural_chars=frozenset(">"),
+diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
+index 9955d93854..90de84d6cf 100644
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -48,6 +48,9 @@ DSML_INVOKE_PREFIX = f'<{_DSML}invoke name="'
+ DSML_INVOKE_NAME_END = '">'
+ DSML_INVOKE_END = f"</{_DSML}invoke>"
+ DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
++# DeepSeek V3.2-style wrapper, recognized only to reject it as foreign
++DSML_FOREIGN_TOOL_START = f"<{_DSML}function_calls>"
++DSML_FOREIGN_TOOL_END = f"</{_DSML}function_calls>"
+ 
+ _ESCAPED_DSML = re.escape(_DSML)
+ _PARAM_RE = re.compile(
+@@ -135,6 +138,8 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+             "INVOKE_NAME_END": DSML_INVOKE_NAME_END,
+             "INVOKE_END": DSML_INVOKE_END,
+             "PARAM_CLOSE": DSML_PARAM_CLOSE,
++            "FOREIGN_START": DSML_FOREIGN_TOOL_START,
++            "FOREIGN_END": DSML_FOREIGN_TOOL_END,
+         },
+         token_id_terminals={
+             "THINK_START": DSML_THINK_START,
+@@ -170,6 +175,33 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+                 ParserState.TOOL_PREAMBLE,
+                 (),
+             ),
++            # Orphan invoke: at long context the model may omit the
++            # <｜DSML｜tool_calls> wrapper and emit the invoke directly.
++            # The invoke marker has no dedicated special token, so hold
++            # events and validate the parsed name before committing.
++            # Only names the request declared are accepted.
++            (ParserState.CONTENT, "INVOKE_PREFIX"): Transition(
++                ParserState.TOOL_NAME,
++                (EventType.TOOL_CALL_START,),
++                validate_tool_name=True,
++            ),
++            # V3.2-style function_calls wrapper is foreign to V4: pass
++            # it and its contents through as plain content
++            (ParserState.CONTENT, "FOREIGN_START"): Transition(
++                ParserState.FOREIGN_BLOCK,
++                (EventType.TEXT_CHUNK,),
++            ),
++            (ParserState.FOREIGN_BLOCK, "FOREIGN_END"): Transition(
++                ParserState.CONTENT,
++                (EventType.TEXT_CHUNK,),
++            ),
++            # The native wrapper always wins over an unclosed foreign
++            # block, so a stray foreign start cannot disable tool
++            # parsing for the rest of the response.
++            (ParserState.FOREIGN_BLOCK, "TOOL_START"): Transition(
++                ParserState.TOOL_PREAMBLE,
++                (),
++            ),
+             (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
+                 ParserState.TOOL_NAME,
+                 (EventType.TOOL_CALL_START,),
+@@ -201,6 +233,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+             ParserState.REASONING: EventType.REASONING_CHUNK,
+             ParserState.TOOL_NAME: EventType.TOOL_NAME,
+             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
++            ParserState.FOREIGN_BLOCK: EventType.TEXT_CHUNK,
+         },
+         arg_converter=_dsml_arg_converter,
+         arg_structural_chars=frozenset(">"),
+@@ -210,6 +243,10 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+ 
+ 
+ class DeepSeekV4Parser(ParserEngine):
++    # The DSv4 thinking template ends the prompt with <think>, so model
++    # output starts mid-reasoning; enable the orphan end-marker recovery.
++    prompt_may_open_reasoning = True
++
+     def __init__(
+         self,
+         tokenizer: TokenizerLike,
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+index 5ed837d22d..88f73ccd27 100644
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -29,6 +29,7 @@ from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserSt
+ from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+ from vllm.tool_parsers.utils import (
+     coerce_to_schema_type,
++    collect_tool_names,
+     extract_types_from_schema,
+     find_tool_name,
+     find_tool_properties,
+@@ -83,6 +84,12 @@ class ParserEngine(Parser):
+     complete output format for a model (reasoning + tool calls).
+     """
+ 
++    # Set True by parsers whose chat template opens the reasoning block in
++    # the PROMPT (the model output then carries only the end marker). Gates
++    # _orphan_reasoning_prefix_events: formats that use end-marker-like
++    # tokens in ordinary text (e.g. Inkling) must leave this False.
++    prompt_may_open_reasoning: bool = False
++
+     def __init__(
+         self,
+         tokenizer: TokenizerLike,
+@@ -107,6 +114,7 @@ class ParserEngine(Parser):
+         self._engine = StreamingParserEngine(
+             parser_engine_config, tokenizer, vocab=self.vocab
+         )
++        self._engine.allowed_tool_names = self._declared_tool_names()
+ 
+         self._has_reasoning = (
+             "THINK_END" in parser_engine_config.token_id_terminals
+@@ -401,6 +409,11 @@ class ParserEngine(Parser):
+ 
+     # ── Private helpers ─────────────────────────────────────────────
+ 
++    def _declared_tool_names(self) -> frozenset[str] | None:
++        if not self._tools:
++            return None
++        return collect_tool_names(self._tools) or None
++
+     def _check_skip_tool_parsing(
+         self,
+         request: ChatCompletionRequest | ResponsesRequest,
+@@ -408,10 +421,21 @@ class ParserEngine(Parser):
+         tools = getattr(request, "tools", None)
+         if tools:
+             self._tools = tools
++            self._engine.allowed_tool_names = self._declared_tool_names()
++        else:
++            # The engine is reused across requests and reset() keeps this
++            # field, so it has to be cleared here.  Otherwise a request
++            # that declares no tools would inherit the names of the
++            # previous one and could recover a tool it never asked for.
++            self._engine.allowed_tool_names = None
+         if not self.skip_tool_parsing and not self._suppress_tool_calls:
+             tool_choice = getattr(request, "tool_choice", None)
+             if tool_choice == "none" and tools:
+                 self._suppress_tool_calls = True
++        # The engine needs the suppression state too: recovery
++        # transitions must not consume text that will never be allowed
++        # to become a tool call.
++        self._engine.suppress_tool_calls = self._suppress_tool_calls
+ 
+     def _strip_content_whitespace(
+         self,
+@@ -496,7 +520,9 @@ class ParserEngine(Parser):
+         request: ChatCompletionRequest | ResponsesRequest,
+     ) -> tuple[str | None, str | None]:
+         self._reset()
+-        events = self._feed(model_output, [])
++        events: list[SemanticEvent] = []
++        events.extend(self._orphan_reasoning_prefix_events(model_output))
++        events.extend(self._feed(model_output, []))
+         events.extend(self._engine.finish())
+ 
+         reasoning_parts: list[str] = []
+@@ -630,6 +656,32 @@ class ParserEngine(Parser):
+ 
+     # ── Single-pass parse helper ────────────────────────────────────────
+ 
++    def _orphan_reasoning_prefix_events(
++        self, text: str
++    ) -> "list[SemanticEvent]":
++        """Seed the state machine when reasoning was opened in the PROMPT.
++
++        DSv4's thinking template ends the prompt with the reasoning start
++        marker, so the model output starts mid-reasoning and carries only the
++        end marker. Without seeding, the prefix leaks into content and the
++        reasoning is lost. Same orphan-marker recovery the DSML tool path
++        applies. No-op when the output opens its own reasoning block, when
++        no end marker is present, or when the parser has no reasoning.
++        """
++        if not self.prompt_may_open_reasoning:
++            return []
++        start = self.reasoning_start_str
++        end = self.reasoning_end_str
++        if (
++            self._has_reasoning
++            and start
++            and end
++            and end in text
++            and (start not in text or text.find(start) > text.find(end))
++        ):
++            return self._feed(start, [])
++        return []
++
+     def _single_pass_parse(
+         self,
+         text: str,
+@@ -642,7 +694,10 @@ class ParserEngine(Parser):
+         state that ``_build_extracted_result`` reads.
+         """
+         self._reset(initial_state=initial_state)
+-        events = self._feed(text, token_ids)
++        events: list[SemanticEvent] = []
++        if initial_state is None:
++            events.extend(self._orphan_reasoning_prefix_events(text))
++        events.extend(self._feed(text, token_ids))
+         events.extend(self._engine.finish())
+ 
+         delta = self._events_to_delta(events, finished=True)
+diff --git a/vllm/parser/engine/parser_engine_config.py b/vllm/parser/engine/parser_engine_config.py
+index ad83e33149..196256706e 100644
+--- a/vllm/parser/engine/parser_engine_config.py
++++ b/vllm/parser/engine/parser_engine_config.py
+@@ -33,6 +33,9 @@ class ParserState(Enum):
+     TOOL_NAME = auto()
+     TOOL_ARGS = auto()
+     TOOL_BETWEEN = auto()
++    # Inside a block belonging to a different model format; terminals
++    # matched here pass through as plain content.
++    FOREIGN_BLOCK = auto()
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -40,6 +43,11 @@ class Transition:
+     next_state: ParserState
+     events: tuple[EventType, ...] = field(default_factory=tuple)
+     skip_in_token_id_mode: bool = False
++    # Hold this transition's events until the tool name completes, then
++    # validate the name before committing to the tool call.  Set on
++    # recovery transitions whose trigger marker has no dedicated special
++    # token, so prose quoting the marker is not misparsed as a tool call.
++    validate_tool_name: bool = False
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/vllm/tokenizers/deepseek_v4_encoding.py b/vllm/tokenizers/deepseek_v4_encoding.py
+index 461f7f391d..7686e6bf28 100644
+--- a/vllm/tokenizers/deepseek_v4_encoding.py
++++ b/vllm/tokenizers/deepseek_v4_encoding.py
+@@ -374,8 +374,21 @@ def render_message(
+             prompt += thinking_end_token if thinking_mode != "thinking" else thinking_start_token
+             prompt += task_sp_token
+ 
+-    elif messages[index].get("role") in ["user", "developer"]:
+-        # Normal generation: append Assistant + thinking token
++    elif messages[index].get("role") in ["user", "developer"] or (
++        messages[index].get("role") == "system" and index + 1 == len(messages)
++    ):
++        # Normal generation: append Assistant + thinking token.
++        #
++        # For user/developer this token is both the inter-turn separator and the
++        # generation prompt. A trailing `system` message needs only the latter:
++        # agent frameworks routinely append a context/reminder system message
++        # after the last user turn, and without the generation prompt the model
++        # sees no assistant boundary and continues the prompt as a document
++        # instead of answering. The `index + 1 == len(messages)` guard keeps a
++        # non-final system message from emitting a separator it does not own --
++        # a system message followed by `latest_reminder` reaches this branch
++        # (that role is exempt from the early return above), and unconditionally
++        # appending there corrupts the reference-golden layouts.
+         prompt += ASSISTANT_SP_TOKEN
+         if not drop_thinking and thinking_mode == "thinking":
+             prompt += thinking_start_token
+diff --git a/vllm/tool_parsers/utils.py b/vllm/tool_parsers/utils.py
+index 98ea9cc195..fdf9f39c21 100644
+--- a/vllm/tool_parsers/utils.py
++++ b/vllm/tool_parsers/utils.py
+@@ -290,6 +290,23 @@ def find_tool_properties(
+     return {}
+ 
+ 
++def collect_tool_names(tools: list[Tool] | None) -> frozenset[str]:
++    """Collect the names of all declared function tools."""
++    if not tools:
++        return frozenset()
++    names: set[str] = set()
++    for tool in tools:
++        if isinstance(tool, (FunctionTool, NamespaceTool)):
++            for name, _ in iter_response_function_tool_info(tool):
++                names.add(name)
++            continue
++        if not _is_function_tool(tool):
++            continue
++        name, _ = _extract_tool_info(tool)
++        names.add(name)
++    return frozenset(names)
++
++
+ def find_tool_name(
+     tools: list[Tool] | None,
+     tool_name: str,
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index df20a90d51..aea78e62ab 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -611,7 +611,9 @@ class WorkerProc:
+             )
+ 
+             # Initializes a message queue for sending the model output
+-            self.worker_response_mq = MessageQueue(1, 1)
++            self.worker_response_mq = MessageQueue(
++                1, 1, max_chunk_bytes=envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
++            )
+             self.peer_response_handles = []
+         else:
+             # Initialize remote MessageQueue for receiving SchedulerOutput across nodes
 diff --git a/vllm/v1/simple_kv_offload/cuda_mem_ops.py b/vllm/v1/simple_kv_offload/cuda_mem_ops.py
 index 69b1677e0a..ecc3c1fc08 100644
 --- a/vllm/v1/simple_kv_offload/cuda_mem_ops.py
@@ -596,10 +994,198 @@ index e519bca261..6b16006786 100644
  
          assert self.disk_path is not None
 diff --git a/vllm/v1/structured_output/__init__.py b/vllm/v1/structured_output/__init__.py
-index 5c1c650b8d..2249b29718 100644
+index f2ba4ac368..2249b29718 100644
 --- a/vllm/v1/structured_output/__init__.py
 +++ b/vllm/v1/structured_output/__init__.py
-@@ -366,8 +366,18 @@ class StructuredOutputManager:
+@@ -56,6 +56,10 @@ class StructuredOutputManager:
+ 
+         self._grammar_bitmask: torch.Tensor | None = None
+         self._full_mask = torch.tensor(-1, dtype=torch.int32)
++        # Set when the configured backend is explicit; see _start_eager_init.
++        self._backend_init_future: (
++            Future[tuple[StructuredOutputBackend, "torch.Tensor"]] | None
++        ) = None
+ 
+         max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
+         self.fill_bitmask_parallel_threshold = 128
+@@ -92,10 +96,109 @@ class StructuredOutputManager:
+                     reasoning_parser
+                 )
+ 
++            self._start_eager_init()
++
+         self.enable_in_reasoning = (
+             self.vllm_config.structured_outputs_config.enable_in_reasoning
+         )
+ 
++    def _start_eager_init(self) -> None:
++        """Build the backend off the critical path when it is known up front.
++
++        Backend construction is lazy because `auto` is only resolved per
++        request. When the backend is configured explicitly, the value is fixed
++        at startup (`SamplingParams._validate_structured_outputs` rejects any
++        request asking for a different one), so there is nothing to wait for
++        and the work can move to the executor. It is worth moving: building
++        `TokenizerInfo` and allocating the token bitmask cost several hundred
++        ms, and today the first structured-output request pays all of it —
++        `TokenizerInfo` synchronously on the input thread, the bitmask on the
++        engine loop.
++
++        Safe under external_launcher despite the determinism carve-out above:
++        this only moves *backend construction* earlier. Grammar creation stays
++        on whichever path `_use_async_grammar_compilation` selects, so the
++        WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR transition still happens at the
++        same point on every rank.
++        """
++        backend = self.vllm_config.structured_outputs_config.backend
++        if backend == "auto":
++            return
++        self._backend_init_future = self.executor.submit(self._build_backend, backend)
++
++    def _build_backend(
++        self, backend: str
++    ) -> tuple[StructuredOutputBackend, "torch.Tensor"]:
++        instance = self._construct_backend(backend)
++        return instance, self._allocate_bitmask(instance)
++
++    def _construct_backend(self, backend: str) -> StructuredOutputBackend:
++        vocab_size = self.vllm_config.model_config.get_vocab_size()
++        if backend == "xgrammar":
++            return XgrammarBackend(
++                self.vllm_config,
++                tokenizer=self.tokenizer,
++                vocab_size=vocab_size,
++            )
++        elif backend == "guidance":
++            return GuidanceBackend(
++                self.vllm_config,
++                tokenizer=self.tokenizer,
++                vocab_size=vocab_size,
++            )
++        elif backend == "outlines":
++            from vllm.v1.structured_output.backend_outlines import OutlinesBackend
++
++            return OutlinesBackend(
++                self.vllm_config,
++                tokenizer=self.tokenizer,
++                vocab_size=vocab_size,
++            )
++        elif backend == "lm-format-enforcer":
++            from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
++                LMFormatEnforcerBackend,
++            )
++
++            return LMFormatEnforcerBackend(
++                self.vllm_config,
++                tokenizer=self.tokenizer,
++                vocab_size=vocab_size,
++            )
++        else:
++            raise ValueError(f"Unsupported structured output backend: {backend}")
++
++    def _allocate_bitmask(self, backend: StructuredOutputBackend) -> "torch.Tensor":
++        # One row per speculative position plus one for the bonus token.
++        return backend.allocate_token_bitmask(
++            self.vllm_config.scheduler_config.max_num_seqs
++            * (1 + self.vllm_config.num_speculative_tokens)
++        )
++
++    def _ensure_backend(self, request: "Request") -> None:
++        """Resolve `self.backend`, adopting the eager result when there is one.
++
++        Called only from `grammar_init`, i.e. only from the input processing
++        thread, so the assignments below are not racing another writer. The
++        engine loop reads `_grammar_bitmask` in `grammar_bitmask()`, but it can
++        only see a structured-output request after that request has been handed
++        to the scheduler, which is ordered after this returns.
++        """
++        if self.backend is not None:
++            return
++
++        if self._backend_init_future is not None:
++            # Re-raises a construction failure here rather than at startup, so
++            # a bad backend still surfaces on the request that needs it.
++            self.backend, bitmask = self._backend_init_future.result()
++            if self._grammar_bitmask is None:
++                self._grammar_bitmask = bitmask
++            return
++
++        assert request.sampling_params is not None
++        self.backend = self._construct_backend(
++            request.sampling_params.structured_outputs._backend
++        )
++
+     def _get_reasoner(self, request: "Request") -> "ReasoningParser | None":
+         structured_req = request.structured_output_request
+         if structured_req is None or self.reasoner_cls is None:
+@@ -121,47 +224,13 @@ class StructuredOutputManager:
+                 and request.sampling_params.structured_outputs is not None
+             )
+ 
+-        # Initialize the backend the first time it is needed.
++        # Initialize the backend the first time it is needed, unless
++        # _start_eager_init already has it in flight.
+         #
+         # NOTE: We only support a single backend. We do NOT support different
+         # backends on a per-request basis in V1 (for now, anyway...).
+         # _backend is set in Processor._validate_structured_output
+-        if self.backend is None:
+-            assert request.sampling_params is not None
+-            backend = request.sampling_params.structured_outputs._backend
+-            vocab_size = self.vllm_config.model_config.get_vocab_size()
+-            if backend == "xgrammar":
+-                self.backend = XgrammarBackend(
+-                    self.vllm_config,
+-                    tokenizer=self.tokenizer,
+-                    vocab_size=vocab_size,
+-                )
+-            elif backend == "guidance":
+-                self.backend = GuidanceBackend(
+-                    self.vllm_config,
+-                    tokenizer=self.tokenizer,
+-                    vocab_size=vocab_size,
+-                )
+-            elif backend == "outlines":
+-                from vllm.v1.structured_output.backend_outlines import OutlinesBackend
+-
+-                self.backend = OutlinesBackend(
+-                    self.vllm_config,
+-                    tokenizer=self.tokenizer,
+-                    vocab_size=vocab_size,
+-                )
+-            elif backend == "lm-format-enforcer":
+-                from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
+-                    LMFormatEnforcerBackend,
+-                )
+-
+-                self.backend = LMFormatEnforcerBackend(
+-                    self.vllm_config,
+-                    tokenizer=self.tokenizer,
+-                    vocab_size=vocab_size,
+-                )
+-            else:
+-                raise ValueError(f"Unsupported structured output backend: {backend}")
++        self._ensure_backend(request)
+ 
+         grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar
+         if self._use_async_grammar_compilation:
+@@ -231,14 +300,10 @@ class StructuredOutputManager:
+ 
+         if self._grammar_bitmask is None:
+             assert self.backend is not None
+-            max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
+-
+             # Allocate a bitmask for each token needing to be checked:
+             # one for each speculative position, and one more for the
+             # bonus token / non-speculative token.
+-            self._grammar_bitmask = self.backend.allocate_token_bitmask(
+-                max_batch_size * (1 + max_num_spec_tokens)
+-            )
++            self._grammar_bitmask = self._allocate_bitmask(self.backend)
+ 
+         # Generate a batched bitmask for all structured output requests.
+         # When speculative decoding is enabled, we need to include multiple
+@@ -301,8 +366,18 @@ class StructuredOutputManager:
                  state_advancements = 0
                  post_reasoning_end_in_window = False
                  req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
@@ -619,7 +1205,7 @@ index 5c1c650b8d..2249b29718 100644
                      advance_grammar = apply_bitmask
                      if token == -1:
                          apply_bitmask = False
-@@ -393,10 +403,11 @@ class StructuredOutputManager:
+@@ -328,10 +403,11 @@ class StructuredOutputManager:
                              apply_bitmask = True
                              advance_grammar = False
                              post_reasoning_end_in_window = True
@@ -634,7 +1220,7 @@ index 5c1c650b8d..2249b29718 100644
                          elif not post_reasoning_end_in_window:
                              raise AssertionError(
                                  (token, req_id, scheduled_spec_decode_tokens)
-@@ -416,7 +427,7 @@ class StructuredOutputManager:
+@@ -351,7 +427,7 @@ class StructuredOutputManager:
                      #   reasoning_ended is only persisted later by
                      #   should_advance.
                      bonus_apply = self.should_fill_bitmask(request) or apply_bitmask
@@ -643,11 +1229,44 @@ index 5c1c650b8d..2249b29718 100644
                      cumulative_index += 1
                  if state_advancements > 0:
                      grammar.rollback(state_advancements)
+@@ -493,5 +569,14 @@ class StructuredOutputManager:
+         return new_token_ids[num_reasoning:]
+ 
+     def clear_backend(self) -> None:
++        if self._backend_init_future is not None:
++            # Shutdown may land before any request touched the backend; adopt
++            # an eagerly-built one so it is still destroyed rather than leaked.
++            future, self._backend_init_future = self._backend_init_future, None
++            if not future.cancel() and self.backend is None:
++                try:
++                    self.backend, _ = future.result()
++                except Exception:
++                    logger.exception("Eager structured-output backend init failed")
+         if self.backend is not None:
+             self.backend.destroy()
 diff --git a/vllm/v1/structured_output/backend_xgrammar.py b/vllm/v1/structured_output/backend_xgrammar.py
-index a8c654ae68..9e3270aa51 100644
+index 258b1dff32..9e3270aa51 100644
 --- a/vllm/v1/structured_output/backend_xgrammar.py
 +++ b/vllm/v1/structured_output/backend_xgrammar.py
-@@ -186,17 +186,30 @@ class XgrammarGrammar(StructuredOutputGrammar):
+@@ -164,9 +164,14 @@ class XgrammarGrammar(StructuredOutputGrammar):
+             return False
+         for token in tokens:
+             if not self.matcher.accept_token(token):
+-                logger.error(
+-                    "Failed to advance FSM for request %s "
+-                    "for tokens %s. Please file an issue.",
++                # Expected under spec decode when reasoning ends mid-window:
++                # drafts made before the grammar engaged may be invalid and
++                # the caller tolerates the rejection (structured_output
++                # advance loop). The FATAL variant is logged by the scheduler
++                # ("Unexpected: grammar rejected tokens ... Terminating"), so
++                # this stays quiet.
++                logger.debug(
++                    "FSM did not advance for request %s on token %s.",
+                     request_id,
+                     token,
+                 )
+@@ -181,17 +186,30 @@ class XgrammarGrammar(StructuredOutputGrammar):
  
          Returns the prefix list of tokens that are accepted by the FSM.
          """

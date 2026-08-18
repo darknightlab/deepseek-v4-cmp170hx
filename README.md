@@ -51,12 +51,13 @@ This repo sits on top of that branch.
 
 ### Official upstream patch queue (experimental)
 
-[`upstream-main/`](upstream-main/README.md) carries the haosdent SM80 work as a patch queue
-on top of a pinned official `vllm-project/vllm` main commit. This removes the long-term need
+[`upstream-main/`](upstream-main/README.md) carries a three-layer queue on a pinned
+official `vllm-project/vllm` main commit: minimal SM80 correctness, optional reachable fork
+performance work, and this repository's 170HX serving fixes. This removes the long-term need
 to clone the force-pushed fork and includes newer upstream features such as bounded native
-disk KV offload. The queue applies cleanly in source-level checks, but has not yet completed
-the four-card correctness and performance suite, so `c3046d1` remains the recommended
-production base.
+disk KV offload. The queue has completed a full sm_80 build and three-card PP/DSpark/disk-KV
+startup plus a real chat request, but has not completed the four-card performance suite, so
+`c3046d1` remains the recommended benchmark baseline.
 
 Prepare a candidate checkout with:
 

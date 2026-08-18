@@ -8,104 +8,146 @@ haosdent merge-base: 62195e9784ebec1ece42b88a861734e0702cc2d5
 official base:       402547d7f02bdbfc5dce5d27dc21f50dd4d627b6
 ```
 
-`git rev-list --count <merge-base>..<haosdent-head>` returns `1`.
+`git rev-list --count <merge-base>..<haosdent-head>` returns `1`. That one
+squash originally touched 111 files and mixed hardware enablement, performance
+experiments, general behavior fixes, tests, and benchmarks.
 
-A direct cherry-pick onto the official base automatically applied 93 files and
-reported 18 conflicts. An initial mechanical resolution kept the official-main
-version of every conflicted file. That queue applied cleanly, but semantic
-review found two source-level inconsistencies in the automatically applied
-files:
+## Why the squash was not kept as one patch
 
-- `sparse_attn_indexer.py` expected query-sharding fields and helpers that the
-  official `mla/indexer.py` metadata does not provide;
-- the fork's MHC TileLang wrapper called three kernels absent from the official
-  `tilelang_kernels.py` selected during conflict resolution.
+A direct cherry-pick automatically applied 93 files and conflicted in 18. The
+first mechanical resolution kept the official side for every conflict, but the
+result was only Git-clean, not source-consistent:
 
-Those two experimental feature groups were restored to the official-main
-implementation as a unit. Their conflict-coupled tests and the fork's benchmark
-artifacts are not carried in this production candidate. Three focused SM80
-kernel tests remain in the patch. The required constructor and forward halves
-of the SM80 indexer fallback are retained separately: CUDA devices without
-DeepGEMM pre-warm and explicitly dispatch prefill/decode logits to the Triton
-MQA kernels, without importing any query-sharding metadata. The first-layer MHC broadcast path likewise selects the existing
-TileLang prenorm GEMM when DeepGEMM is unavailable, matching the fallback
-already used by the other MHC pre paths. Its ragged SWA metadata builder also
-returns an empty FlashMLA scheduler plan, since the ROCm/Ampere Triton decode
-path never calls FlashMLA. The shared ROCm/Ampere sparse decode kernels decode
-raw FP8 cache bytes through the SM80-aware helper, preserving native FNUZ/OCP
-casts where supported and using the software E4M3 path on pre-SM89 CUDA.
+- the fork indexer caller expected query-sharding metadata omitted with the
+  official `mla/indexer.py`;
+- the fork MHC wrapper called kernels omitted with the official
+  `tilelang_kernels.py`;
+- several helper modules and environment switches remained after their model or
+  worker callers had been replaced by official code.
 
-The full build also exposed two native compile errors. The fork's persistent
-top-k rewrite indexed two histogram buffers with an out-of-scope `iter`
-identifier; both sites now use the function's `radix_iter` parameter, matching
-its existing global-round calculation. The pinned official base also declared
-`fused_gdn_decode_post_conv_mtp()` under the KDA feature guard while registering
-it under the GDN guard; the declaration now uses `VLLM_ENABLE_FUSED_GDN_DECODE`,
-which is required by the SM80 build configuration.
+Hardware execution later exposed additional paired contracts: SM80 DeepGEMM
+fallbacks, FlashMLA planning, FP8 decode, disk O_DIRECT alignment, KV block
+zeroing, and cudagraph dispatch. The final queue therefore separates required
+support from optional optimization and removes unreachable providers.
 
-The semantic review retained official main for 16 conflict files and ported the
-required fork behavior into two conflict files:
+## Layer 1: minimal SM80 correctness
 
-- `vllm/models/deepseek_v4/nvidia/model.py`: select the Ampere Triton sparse-MLA
-  backend on SM8x and reject the Blackwell-only FP4 indexer cache;
-- `vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py`: use the
-  software E4M3 encoder for all three FP8 cache-write sites on SM80, and retain
-  the measured compressor warp selection.
+The first patch contains only the path required to build and execute DSv4 on
+pre-SM89 CUDA:
 
-The other conflict files use the newer official implementations in the fork
-layer. `model_runner.py` receives the repository's separate DSpark+PP additions
-in the second patch:
+- Ampere backend selection and registry entries;
+- Triton sparse MLA and MQA indexer logits;
+- software E4M3 encode/decode for SM80;
+- SM80-aware cache compression, indexer Q, and sparse decode;
+- explicit prefill/decode dispatch when DeepGEMM is unavailable;
+- MHC first-layer TileLang fallback;
+- pre-Hopper CuTeDSL guards;
+- ragged Triton metadata without FlashMLA scheduler planning;
+- the official-base GDN declaration guard fix;
+- three focused CUDA correctness tests.
+
+The minimal MQA implementation uses conservative controls: ungrouped prefill,
+no register cap, in-kernel Q decode, and no scale-factor hoist. It does not
+modify `vllm/envs.py`.
+
+## Layer 2: optional reachable performance work
+
+The second patch can be omitted without disabling SM80 or downstream serving.
+It contains fork code that still has a real caller:
+
+- deterministic persistent top-k and sampler tie handling;
+- Marlin occupancy experiments and optional FP8-to-BF16 dequantization;
+- SM80 router GEMV;
+- deterministic MoE alignment;
+- hierarchical all-reduce and configurable custom-AR capacity;
+- vocab-parallel local argmax infrastructure used by supported proposers;
+- wide cache gather/dequant and compressor warp tuning;
+- grouped/scaled indexer-logits tuning and paged-Q predecode;
+- multi-stream safety and disable controls.
+
+It deliberately excludes half-connected features:
 
 ```text
-tests/kernels/test_compressor_kv_cache.py
-tests/models/test_dspark_mla.py
-tests/v1/worker/test_kv_block_zeroer.py
-vllm/model_executor/kernels/mhc/tilelang_kernels.py
-vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
-vllm/model_executor/models/qwen3_dspark.py
-vllm/models/deepseek_v4/amd/rocm.py
-vllm/models/deepseek_v4/attention.py
-vllm/models/deepseek_v4/nvidia/dspark.py
-vllm/parser/engine/streaming_parser_engine.py
-vllm/v1/attention/backends/mla/indexer.py
-vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
-vllm/v1/worker/gpu/model_runner.py
-vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
-vllm/v1/worker/gpu/structured_outputs.py
-vllm/v1/worker/utils.py
+MHC int8 all-reduce and hoist
+MHC fused-sqrsum/prenorm-shard providers without callers
+DSpark fused Markov sampler without model hooks
+attention GEMM unreplication/query sharding without metadata consumers
+PinnedStagingPool without a model-runner consumer
+cudagraph pad-up using the obsolete _is_compatible signature
 ```
 
-Relevant later upstream work includes KV block-zeroing fixes (#50276, #51749,
-#52058), DSpark scheduling (#47808), DSV4 plain/MTP/DSpark correctness (#51538),
-KV layout changes (#51704), and structured-output fixes (#52436). Choosing the
-old fork side wholesale for these conflicts would discard those changes. The
-fork's paired per-group block-zeroing scheduler protocol is also omitted, so
-`KVCacheManager`, scheduler output, and the newer official `KVBlockZeroer`
-retain one internally consistent upstream contract. The fork's cudagraph
-pad-up fallback is omitted as well; its `_is_compatible()` call predates the
-pinned base's required `max_query_len` argument and crashed long-context
-serving after startup.
+Their modules and inert environment variables are not exported.
 
-Fork-only conflict hunks not ported are optional or superseded paths, including
-adaptive Marlin workspace/block sizing, MHC fused-sqrsum and int8 all-reduce
-call sites, indexer query/decode sharding, and DSpark vocab-sharded Markov
-fusion. In particular, the DSpark fork hunks predate the official confidence
-head and adaptive-verification implementation, so replacing those files would
-regress current DSpark correctness. They can be reconsidered as isolated
-follow-up patches with dedicated tests and A100 measurements.
+## Layer 3: downstream serving behavior
 
-After the first layer, the repository's existing patches were replayed. Patches
-0003, 0005, 0005a, 008, and 009 applied directly. Patch 0006 was re-expressed
-against the official indexer flow: it row-chunks `fp8_fp4_mqa_logits` without
-requiring fork query-sharding metadata. Patches 0002 and 0004 were manually
-relocated to the current `SpeculativeConfig` and GPU model-runner structure
-without changing their DSpark+PP behavior. Patch 0001 remains omitted because
-its guard was already upstream. The disk backend now stores arbitrary PP KV
-payload sizes in 4096-byte-aligned slot rows: GPU DMA copies only the real
-payload, while O_DIRECT reads and writes the padded stride and capacity is
-bounded using that physical stride.
+The third patch contains project-owned behavior rather than generic SM80
+support:
 
-This is a source-level rebase, not a hardware certification. The SM80 backend
-selection and software FP8 encoding are now source-consistent, but only a full
-sm_80 build and four-GPU run can validate kernel compilation, correctness, and
-performance.
+- DSpark draft placement and propagation across pipeline ranks;
+- long-context prefill top-k fallback and logits row chunking;
+- structured-output and Responses fixes;
+- DeepSeek reasoning/tool parser and tokenizer compatibility;
+- worker response queue sizing;
+- bounded disk KV offload with three independent physical/copy sizes:
+  GPU block stride, payload bytes, and 4096-aligned disk stride.
+
+The disk slot count is derived from the physical aligned stride, so configured
+capacity remains bounded for non-aligned PP partitions.
+
+## Conflict outcome
+
+Of the original 18 conflict files, 12 remain byte-for-byte official. Six are
+selectively modified on top of the official implementation:
+
+```text
+vllm/models/deepseek_v4/amd/rocm.py
+vllm/models/deepseek_v4/attention.py
+vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+vllm/models/deepseek_v4/nvidia/model.py
+vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+vllm/v1/worker/gpu/model_runner.py
+```
+
+The first five carry required SM80 behavior. `gpu/model_runner.py` carries the
+separate DSpark+PP downstream behavior.
+
+Newer official KV block-zeroing fixes and their flat scheduler protocol are
+retained as one unit. The fork's per-group scheduler half is not mixed with the
+official worker half. The incompatible cudagraph pad-up experiment is also
+omitted; official eager fallback is used for uncaptured shapes.
+
+## Build and hardware findings
+
+Full native build found and fixed:
+
+- two out-of-scope `iter` references in persistent top-k, now `radix_iter`;
+- `fused_gdn_decode_post_conv_mtp()` declared under KDA instead of GDN.
+
+Three-card CMP 170HX startup found and fixed:
+
+- DeepGEMM hard requirements before Triton fallback;
+- missing first-layer MHC fallback;
+- FlashMLA planning on the Ampere ragged Triton path;
+- native `fp8e4nv` decode in shared ROCm/Ampere kernels;
+- indexer prefill/decode wrappers still dispatching to DeepGEMM;
+- fork-vs-official decode metadata field layout;
+- O_DIRECT disk slots requiring naturally aligned PP payloads;
+- mixed fork/official KV block-zeroing protocols;
+- obsolete cudagraph compatibility call signature.
+
+The final three-layer tree completed PP3 startup, sparse warmup, DSpark graph
+capture, disk backend initialization, model listing, and a real chat request.
+
+## Verification matrix
+
+All three source combinations are checked from the pinned base:
+
+```text
+minimal only                  git am + compileall: PASS
+minimal + downstream          git am + compileall: PASS
+minimal + performance + downstream: PASS
+full exported tree identity:  PASS
+```
+
+Performance/no-performance hardware comparison and four-card certification
+remain outstanding.

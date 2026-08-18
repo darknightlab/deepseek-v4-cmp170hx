@@ -7,6 +7,7 @@ PATCH_DIR="$PROJECT_ROOT/upstream-main/patches"
 PINNED_REF="$(tr -d '[:space:]' < "$PROJECT_ROOT/upstream-main/UPSTREAM_VLLM_REF")"
 DEST="${1:-$PROJECT_ROOT/.work/vllm-upstream}"
 VLLM_REF="${VLLM_REF:-$PINNED_REF}"
+VLLM_APPLY_FORK_PERFORMANCE="${VLLM_APPLY_FORK_PERFORMANCE:-1}"
 
 if [[ ! -d "$DEST/.git" ]]; then
     mkdir -p "$(dirname "$DEST")"
@@ -38,11 +39,32 @@ if [[ "$VLLM_REF" != "$PINNED_REF" ]]; then
     echo "WARNING: patches were rebased and verified against $PINNED_REF, not $VLLM_REF." >&2
 fi
 
+PATCHES=(
+    "$PATCH_DIR"/0001-*.patch
+)
+case "$VLLM_APPLY_FORK_PERFORMANCE" in
+    1) PATCHES+=("$PATCH_DIR"/0002-*.patch) ;;
+    0) ;;
+    *)
+        echo "ERROR: VLLM_APPLY_FORK_PERFORMANCE must be 0 or 1." >&2
+        exit 1
+        ;;
+esac
+PATCHES+=("$PATCH_DIR"/0003-*.patch)
+
+for patch in "${PATCHES[@]}"; do
+    if [[ ! -f "$patch" ]]; then
+        echo "ERROR: expected patch not found: $patch" >&2
+        exit 1
+    fi
+done
+
 git -C "$DEST" \
     -c user.name="deepseek-v4-cmp170hx patcher" \
     -c user.email="noreply@localhost" \
-    am --3way "$PATCH_DIR"/*.patch
+    am --3way "${PATCHES[@]}"
 
 printf 'Prepared vLLM checkout at %s\n' "$DEST"
 printf 'Base: %s\n' "$VLLM_REF"
+printf 'Fork performance patch: %s\n' "$VLLM_APPLY_FORK_PERFORMANCE"
 printf 'Result: %s\n' "$(git -C "$DEST" rev-parse HEAD)"
