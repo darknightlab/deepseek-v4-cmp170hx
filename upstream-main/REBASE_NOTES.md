@@ -27,7 +27,8 @@ by the default profile.
 
 ## Minimal correctness patch
 
-`0001` contains only the pre-SM89 execution path:
+`patches/core/0001-sm8x-correctness.patch` contains only the pre-SM89
+execution path:
 
 - Ampere backend selection;
 - Triton sparse MLA and indexer MQA logits;
@@ -42,45 +43,46 @@ decode, and no k-scale factoring. It does not modify `vllm/envs.py`.
 
 ## SM8x deployment profile
 
-`VLLM_FORK_PERFORMANCE_PROFILE=sm8x` applies only the minimal correctness
-patch, SM80/SM86-specific tuning (`0002`, `0004`-`0006`, `0008`, `0013`,
-`0014`), and downstream `0023`. It excludes architecture-neutral and unrelated
-experimental features. The 170HX compose must still set
-`VLLM_MARLIN_FP8_DEQUANT_BF16=1`; applying `0004` provides the path but does
+`VLLM_FORK_PERFORMANCE_PROFILE=sm8x` reads `patches/series/sm8x.txt` and
+applies only core correctness, the six patches under `patches/sm8x/`, and
+`patches/downstream/0001-170hx-serving.patch`. It excludes architecture-neutral
+and unrelated experimental features. The 170HX compose must still set
+`VLLM_MARLIN_FP8_DEQUANT_BF16=1`; the Marlin patch provides the path but does
 not force its memory/performance trade globally.
 
 ## Verified feature patches
 
-The default verified profile explicitly applies `0002`-`0005` and
-`0007`-`0015`; `0006` is SM8x-specific but remains current-port experimental.
-The patches cover indexer logits, top-k, Marlin-dequant, router GEMV,
-deterministic MoE alignment, all-reduce, local argmax, cache gather, compressor
-warps, and multi-stream control.
+The default verified profile is defined by `patches/series/verified.txt`, not
+by directory traversal. It combines all `sm8x/` patches except the unverified
+Attention GEMV with the seven `general/` patches. The features cover indexer
+logits, top-k, Marlin-dequant, router GEMV, deterministic MoE alignment,
+all-reduce, local argmax, cache gather, compressor warps, and multi-stream
+control.
 
 ## Experimental feature patches
 
-- `0006`: Attention indexer-weights SM80 GEMV; included by `sm8x`, excluded
-  from the default verified profile until current-port hardware A/B.
-- `0016`: the fork's Marlin occupancy/warp perturbations. The measurement record
-  says these regress; flags remain off.
-- `0017`: cudagraph pad-up ported to the current six-argument
-  `_is_compatible(..., max_query_len)` API. The obsolete five-argument version
-  caused a production EngineCore failure and is not exported.
-- `0018`: pinned staging pool plus all three model-runner consumers.
-- `0019`: adaptive Marlin MoE block-size API.
-- `0020`: persistent Marlin MoE workspace wired into all current call sites.
-- `0021`: Attention input projection fusion only.
-- `0022`: replicated Attention GEMM token sharding only.
-- `0024`: DSpark vocab-sharded Markov selection while retaining official
-  confidence/adaptive-verification behavior.
-- `0025`: fused Markov kernels; automatically declines when adaptive verification
-  is enabled or fusion operands are unsupported.
-- `0026`: rank-uniform indexer prefill/decode query sharding with caller,
-  metadata, and attention Q-path wiring in one patch.
+- `experimental-sm8x/0001-attention-indexer-gemv.patch`: included by `all`,
+  excluded from the default `sm8x` profile until current-port hardware A/B.
+- `experimental-sm8x/0002-marlin-occupancy.patch`: the fork measurement record
+  says these perturbations regress; flags remain off.
+- `experimental-general/0001-cudagraph-pad-up.patch`: ported to the current
+  six-argument `_is_compatible(..., max_query_len)` API.
+- `experimental-general/0002-pinned-staging.patch`: staging pool plus all three
+  model-runner consumers.
+- `experimental-sm8x/0003-marlin-moe-block-size.patch`: adaptive block-size API.
+- `experimental-general/0003-marlin-moe-workspace.patch`: persistent workspace
+  wired into current call sites.
+- `experimental-general/0004-attention-input-fusion.patch`: input fusion only.
+- `experimental-general/0005-attention-tp-sharding.patch`: token sharding only.
+- `experimental-general/0006-dspark-vocab-shard.patch`: Markov vocab sharding.
+- `experimental-general/0007-dspark-fused-markov.patch`: fused Markov kernels.
+- `experimental-general/0008-indexer-query-sharding.patch`: rank-uniform
+  prefill/decode query sharding.
 
 ## Downstream patch
 
-`0023` contains project behavior rather than generic fork optimization:
+`patches/downstream/0001-170hx-serving.patch` contains project behavior rather
+than generic fork optimization:
 
 - DSpark placement and draft propagation over PP;
 - long-context top-k fallback and row chunking;
@@ -126,7 +128,9 @@ The decode-maxnreg and query-blocked-decode knobs are preserved in the fork
 record as measured regressions and are not counted among these ten effective
 optimizations.
 
-The existing `0011`, `0013`, and `0026` already carry the independently
+The existing `sm8x/0005-sparse-kv-gather.patch`,
+`sm8x/0001-indexer-mqa.patch`, and
+`experimental-general/0008-indexer-query-sharding.patch` carry the independently
 portable cache, indexer-logits, and query-sharding parts.
 
 No non-applying or compile-broken source diff is stored as a usable patch.

@@ -7,7 +7,7 @@ PATCH_DIR="$PROJECT_ROOT/upstream-main/patches"
 PINNED_REF="$(tr -d '[:space:]' < "$PROJECT_ROOT/upstream-main/UPSTREAM_VLLM_REF")"
 DEST="${1:-$PROJECT_ROOT/.work/vllm-upstream}"
 VLLM_REF="${VLLM_REF:-$PINNED_REF}"
-VLLM_FORK_PERFORMANCE_PROFILE="${VLLM_FORK_PERFORMANCE_PROFILE:-verified}"
+VLLM_FORK_PERFORMANCE_PROFILE="${VLLM_FORK_PERFORMANCE_PROFILE:-sm8x}"
 
 if [[ ! -d "$DEST/.git" ]]; then
     mkdir -p "$(dirname "$DEST")"
@@ -39,45 +39,27 @@ if [[ "$VLLM_REF" != "$PINNED_REF" ]]; then
     echo "WARNING: patches were rebased and verified against $PINNED_REF, not $VLLM_REF." >&2
 fi
 
+SERIES_FILE="$PATCH_DIR/series/$VLLM_FORK_PERFORMANCE_PROFILE.txt"
+if [[ ! -f "$SERIES_FILE" ]]; then
+    echo "ERROR: unknown performance profile: $VLLM_FORK_PERFORMANCE_PROFILE" >&2
+    echo "Expected one of: none, sm8x, verified, all." >&2
+    exit 1
+fi
+
 PATCHES=()
-add_patch() {
-    local prefix="$1"
-    local matches=("$PATCH_DIR"/"$prefix"-*.patch)
-    if [[ ${#matches[@]} -ne 1 || ! -f "${matches[0]}" ]]; then
-        echo "ERROR: expected exactly one $prefix patch in $PATCH_DIR." >&2
+while IFS= read -r relative_path; do
+    [[ -z "$relative_path" || "$relative_path" == \#* ]] && continue
+    patch="$PATCH_DIR/$relative_path"
+    if [[ ! -f "$patch" ]]; then
+        echo "ERROR: series entry not found: $patch" >&2
         exit 1
     fi
-    PATCHES+=("${matches[0]}")
-}
+    PATCHES+=("$patch")
+done < "$SERIES_FILE"
 
-add_patch 0001
-case "$VLLM_FORK_PERFORMANCE_PROFILE" in
-    none) ;;
-    sm8x)
-        for n in 2 4 5 6 8 13 14; do
-            add_patch "$(printf '%04d' "$n")"
-        done
-        ;;
-    verified)
-        for n in 2 3 4 5 7 8 9 10 11 12 13 14 15; do
-            add_patch "$(printf '%04d' "$n")"
-        done
-        ;;
-    all)
-        for n in $(seq 2 22); do
-            add_patch "$(printf '%04d' "$n")"
-        done
-        ;;
-    *)
-        echo "ERROR: VLLM_FORK_PERFORMANCE_PROFILE must be none, sm8x, verified, or all." >&2
-        exit 1
-        ;;
-esac
-add_patch 0023
-if [[ "$VLLM_FORK_PERFORMANCE_PROFILE" == "all" ]]; then
-    for n in $(seq 24 26); do
-        add_patch "$(printf '%04d' "$n")"
-    done
+if [[ ${#PATCHES[@]} -eq 0 ]]; then
+    echo "ERROR: empty patch series: $SERIES_FILE" >&2
+    exit 1
 fi
 
 git -C "$DEST" \

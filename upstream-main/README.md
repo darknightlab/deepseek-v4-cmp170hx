@@ -6,76 +6,106 @@ Pinned base:
 vllm-project/vllm 402547d7f02bdbfc5dce5d27dc21f50dd4d627b6
 ```
 
-The queue is ordered, feature-scoped, and reproducible. Patch `0001` is the
-minimal SM80 execution path. Each subsequent optimization has its own patch;
-`0023` is the project downstream layer. Experimental patches are never enabled
-by the default profile.
+Patches are grouped by purpose. The order for each build profile is explicit in
+`patches/series/*.txt`; directory order is never used as an implicit dependency
+order.
 
 ## Profiles
 
 ```bash
-# Minimal SM80 + downstream serving, no fork performance work
+# Default: SM80/SM86 correctness and hardware-specific tuning + downstream
+./scripts/prepare-upstream-vllm.sh /opt/vllm-sm8x
+
+# Minimal SM8x execution + downstream, no performance patches
 VLLM_FORK_PERFORMANCE_PROFILE=none \
-  ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm80-minimal
+  ./scripts/prepare-upstream-vllm.sh /opt/vllm-minimal
 
-# SM80/SM86-specific execution and tuning only, plus downstream
-VLLM_FORK_PERFORMANCE_PROFILE=sm8x \
-  ./scripts/prepare-upstream-vllm.sh /opt/vllm-sm8x
+# SM8x and architecture-neutral verified patches + downstream
+VLLM_FORK_PERFORMANCE_PROFILE=verified \
+  ./scripts/prepare-upstream-vllm.sh /opt/vllm-verified
 
-# Default: explicitly selected reachable optimizations
-./scripts/prepare-upstream-vllm.sh /opt/vllm-upstream
-
-# Include every compile-checked experimental port
+# Every exported experimental port
 VLLM_FORK_PERFORMANCE_PROFILE=all \
-  ./scripts/prepare-upstream-vllm.sh /opt/vllm-upstream-all
+  ./scripts/prepare-upstream-vllm.sh /opt/vllm-all
 ```
 
-| Profile | Applied patches | Purpose |
+| Profile | Series file | Purpose |
 |---|---|---|
-| `none` | `0001`, `0023` | Minimal SM8x execution plus downstream |
-| `sm8x` | `0001`, `0002`, `0004`-`0006`, `0008`, `0013`, `0014`, `0023` | SM80/SM86-specific path and tuning |
-| `verified` | `0001`, `0002`-`0005`, `0007`-`0015`, `0023` | Default verified feature set |
-| `all` | `0001`-`0026` | All exported experiments |
+| `none` | `series/none.txt` | Minimal SM8x path plus downstream |
+| `sm8x` | `series/sm8x.txt` | Default SM80/SM86-only tuning plus downstream |
+| `verified` | `series/verified.txt` | SM8x and general verified features |
+| `all` | `series/all.txt` | Every compile-checked experiment |
 
-## Patch index
+The 170HX runtime must still set:
 
-| Patch | Feature | Default |
-|---|---|---|
-| 0001 | Minimal Ampere correctness: backend, software FP8, Triton sparse MLA/MQA, fallbacks | always |
-| 0002 | SM80 MQA/indexer logits tuning | verified |
-| 0003 | Deterministic persistent top-k and sampler | verified |
-| 0004 | Optional Marlin FP8-to-BF16 dequantization | verified |
-| 0005 | SM80 router BF16 Triton GEMV | verified |
-| 0006 | Attention indexer-weights SM80 GEMV | experiment; included by `sm8x` |
-| 0007 | Deterministic MoE alignment | verified, runtime flag off |
-| 0008 | A100 custom-AR one-shot/two-shot crossover | verified |
-| 0009 | Configurable custom-AR registered-buffer capacity | verified |
-| 0010 | Skip unsupported MNNVL multicast setup | verified |
-| 0011 | Island-aware hierarchical all-reduce | verified |
-| 0012 | Vocab-parallel local argmax infrastructure | verified |
-| 0013 | Wide sparse KV gather/dequantization | verified |
-| 0014 | Sparse compressor warp sizing | verified |
-| 0015 | Multi-stream capture safety and control | verified |
-| 0016 | Marlin occupancy/warp perturbations | experiment, flags off |
-| 0017 | Cudagraph PIECEWISE pad-up with current `max_query_len` API | experiment |
-| 0018 | Pinned input metadata staging pools | experiment |
-| 0019 | Adaptive Marlin MoE block-size selector | experiment |
-| 0020 | Persistent Marlin MoE workspace | experiment |
-| 0021 | Fuse replicated Attention input projections | experiment |
-| 0022 | TP-shard replicated Attention GEMMs | experiment |
-| 0023 | 170HX downstream: DSpark+PP, long context, parsers, structured output, disk KV | always |
-| 0024 | DSpark vocab-sharded Markov local argmax | experiment |
-| 0025 | DSpark fused sequential Markov argmax | experiment |
-| 0026 | Indexer prefill/decode query-row sharding | experiment |
+```text
+VLLM_MARLIN_FP8_DEQUANT_BF16=1
+```
 
-The patch boundaries are functional boundaries, not one-file boundaries. A
-feature patch includes all of its required caller, metadata, kernel, config,
-and test changes.
+The SM8x series includes the implementation patch, but does not force this
+VRAM/performance trade for every deployment.
 
-## Deliberately not exported yet
+## Categories
 
-Ten meaningful fork optimizations still require a semantic port before they
-can be represented as usable official-main patches:
+### `patches/core/`
+
+| Patch | Feature |
+|---|---|
+| `0001-sm8x-correctness.patch` | Ampere backend, software FP8, Triton sparse MLA/MQA, DeepGEMM/CuTeDSL/MHC fallbacks |
+
+### `patches/sm8x/`
+
+| Patch | Feature |
+|---|---|
+| `0001-indexer-mqa.patch` | SM80 MQA/indexer logits tuning |
+| `0002-marlin-fp8-dequant.patch` | Optional FP8-to-BF16/cuBLAS loading path |
+| `0003-router-gemv.patch` | SM80 router BF16 GEMV |
+| `0004-custom-ar-crossover.patch` | A100 custom-AR one-shot crossover |
+| `0005-sparse-kv-gather.patch` | Sparse KV gather/dequant tuning |
+| `0006-compressor-warps.patch` | Sparse compressor warp sizing |
+
+### `patches/general/`
+
+| Patch | Feature |
+|---|---|
+| `0001-deterministic-topk.patch` | Deterministic top-k and sampler |
+| `0002-deterministic-moe-align.patch` | Deterministic MoE alignment |
+| `0003-custom-ar-capacity.patch` | Configurable custom-AR capacity |
+| `0004-mnnvl-guard.patch` | MNNVL multicast capability guard |
+| `0005-hierarchical-allreduce.patch` | Island-aware hierarchical all-reduce |
+| `0006-local-argmax.patch` | Vocab-parallel local argmax infrastructure |
+| `0007-multistream-control.patch` | Multi-stream capture safety/control |
+
+### `patches/experimental-sm8x/`
+
+| Patch | Feature |
+|---|---|
+| `0001-attention-indexer-gemv.patch` | Attention indexer-weights SM80 GEMV |
+| `0002-marlin-occupancy.patch` | Marlin occupancy/warp perturbations; fork measured regression |
+| `0003-marlin-moe-block-size.patch` | Adaptive Marlin MoE block-size API |
+
+### `patches/experimental-general/`
+
+| Patch | Feature |
+|---|---|
+| `0001-cudagraph-pad-up.patch` | PIECEWISE graph pad-up using current `max_query_len` API |
+| `0002-pinned-staging.patch` | Pinned metadata staging pools and consumers |
+| `0003-marlin-moe-workspace.patch` | Persistent Marlin MoE workspace |
+| `0004-attention-input-fusion.patch` | Fuse replicated Attention projections |
+| `0005-attention-tp-sharding.patch` | TP-shard replicated Attention GEMMs |
+| `0006-dspark-vocab-shard.patch` | DSpark vocab-sharded Markov selection |
+| `0007-dspark-fused-markov.patch` | DSpark fused sequential Markov kernels |
+| `0008-indexer-query-sharding.patch` | Indexer prefill/decode query-row sharding |
+
+### `patches/downstream/`
+
+| Patch | Feature |
+|---|---|
+| `0001-170hx-serving.patch` | DSpark+PP, long context, parser/API, structured output, aligned O_DIRECT disk KV |
+
+## Remaining fork ports
+
+Ten effective fork optimizations are not yet exported:
 
 - MHC: fused post/sqrsum, prenorm row sharding, fixed split selection, and
   int8 all-reduce ownership (4);
@@ -83,14 +113,8 @@ can be represented as usable official-main patches:
   uniform decode grouping, decode split tuning, and exact-tile specialization
   (6).
 
-Two additional sparse knobs (`decode maxnreg` and query-blocked decode) are
-recorded fork experiments that measured slower; they are not counted among the
-ten remaining effective optimizations.
-
-Their fork versions overwrite newer official metadata/kernel APIs. Keeping a
-raw diff that does not apply or compile would recreate the half-connected-code
-problem this split is meant to solve. They remain tracked in
-`REBASE_NOTES.md` and are not silently folded into another patch.
+Two measured-regression knobs (`decode maxnreg`, query-blocked decode) are
+recorded separately and are not counted among those ten.
 
 ## Build
 
@@ -100,22 +124,20 @@ cp /path/to/deepseek-v4-cmp170hx/docker/dockerignore.txt .dockerignore
 podman build -f Dockerfile.splitbuild -t darknightlab/vllm-170hx:upstream-main .
 ```
 
-Patch `0001` changes a native header. Several verified/experimental patches
-change CUDA sources. Use a full sm_80 build for a clean image.
+The core patch changes a native header, and some optional patches change CUDA
+sources. Use a full sm_80 build for a clean image.
 
 ## Verification
 
 Completed:
 
-- `none`, `verified`, and `all` profiles apply cleanly from the pin;
-- all three profiles pass Python compilation;
-- the `all` profile matches its submitted Git tree exactly;
-- the pre-split active feature set completed a full sm_80 build and PP3
-  startup, DSpark capture, bounded disk-KV initialization, model listing, and
-  a real chat request.
+- all four series apply cleanly from the official pin;
+- all four series pass Python compilation and `git diff --check`;
+- the `all` series matches its submitted Git tree exactly;
+- the `sm8x` series contains only core, SM8x, and downstream paths.
 
 Still required:
 
-- full native build and hardware A/B for the new per-feature profiles;
-- hardware verification of each experimental patch individually;
+- full native build and hardware A/B for the new category series;
+- individual hardware certification of experimental patches;
 - four-card and sustained long-context testing.
